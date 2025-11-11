@@ -581,57 +581,200 @@ def internal_error(error):
 # ============================================================================
 
 @app.route('/health', methods=['GET'])
+@limiter.exempt  # Isento de rate limiting (health checks frequentes)
 def health_check():
-    """Health check - SEM autenticação"""
+    """Health check - Informações básicas apenas"""
     return jsonify({
         'status': 'healthy',
-        'service': 'pdf-image-processor',
-        'version': '3.4',
-        'worker_pid': os.getpid(),
-        'redis': redis_url,
-        'security': {
-            'api_key_required': True,
-            'api_keys_configured': len(CONFIG['API_KEYS']),
-            'api_key_header': CONFIG['API_KEY_HEADER']
-        },
-        'config': {
-            'max_file_mb': CONFIG['MAX_CONTENT_LENGTH'] / (1024 * 1024),
-            'line_cleanup_enabled': CONFIG['ENABLE_LINE_CLEANUP']
-        }
+        'version': '3.4'
     }), 200
 
 @app.route('/ready', methods=['GET'])
+@limiter.exempt  # Isento de rate limiting
 def readiness_check():
-    """Readiness check - SEM autenticação"""
-    return jsonify({'status': 'ready'}), 200
+    """Readiness check - Kubernetes/Docker"""
+    return jsonify({
+        'status': 'ready',
+        'version': '3.4'
+    }), 200
+
+@app.route('/', methods=['GET'])
+@limiter.exempt  # Isento de rate limiting
+def index():
+    """Homepage - Informações básicas apenas"""
+    return jsonify({
+        'service': 'PDF/Image Processor',
+        'status': 'online',
+        'version': '3.4'
+    }), 200
+
+@app.route('/docs', methods=['GET'])
+@require_api_key  # Protegido - requer API Key
+def documentation():
+    """Documentação completa - REQUER API KEY"""
+    return jsonify({
+        'service': 'PDF/Image Processor',
+        'version': '3.4',
+        'status': 'production-ready',
+        'improvements_v3.4': [
+            '🔐 API Key obrigatória (sempre habilitada)',
+            '🚦 Rate limiting avançado por IP (min/hora/dia)',
+            '📊 Headers X-RateLimit-* informativos',
+            '🔑 Endpoint /generate-key para criar novas keys',
+            '⚡ Detecção de linhas configurável',
+            '🛡️ Constant-time key comparison (timing attack protection)',
+            '✅ Health checks isentos de rate limiting',
+            '🔒 Endpoints públicos minimalistas'
+        ],
+        'security': {
+            'api_key_required': True,
+            'api_key_header': CONFIG['API_KEY_HEADER'],
+            'api_keys_configured': len(CONFIG['API_KEYS']),
+            'rate_limits': {
+                'per_minute': CONFIG['RATE_LIMIT_PER_MINUTE'],
+                'per_hour': CONFIG['RATE_LIMIT_PER_HOUR'],
+                'per_day': CONFIG['RATE_LIMIT_PER_DAY']
+            }
+        },
+        'endpoints': {
+            'POST /process': {
+                'description': 'Processa PDF ou imagem',
+                'authentication': f'API Key no header {CONFIG["API_KEY_HEADER"]}',
+                'rate_limit': f"{CONFIG['RATE_LIMIT_PER_MINUTE']}/min, {CONFIG['RATE_LIMIT_PER_HOUR']}/hour, {CONFIG['RATE_LIMIT_PER_DAY']}/day",
+                'max_size_mb': CONFIG['MAX_CONTENT_LENGTH'] / (1024 * 1024),
+                'formats': list(ALLOWED_MIMES)
+            },
+            'POST /generate-key': {
+                'description': 'Gera nova API key',
+                'authentication': 'API Key (admin)',
+                'protected': True
+            },
+            'GET /health': {
+                'description': 'Health check',
+                'authentication': 'Público',
+                'rate_limit': 'Isento'
+            },
+            'GET /ready': {
+                'description': 'Readiness check',
+                'authentication': 'Público',
+                'rate_limit': 'Isento'
+            },
+            'GET /': {
+                'description': 'Homepage',
+                'authentication': 'Público',
+                'rate_limit': 'Isento'
+            },
+            'GET /docs': {
+                'description': 'Documentação completa',
+                'authentication': 'API Key',
+                'protected': True
+            }
+        },
+        'usage_examples': {
+            'process_file': {
+                'curl': f"curl -X POST \\\n  -H '{CONFIG['API_KEY_HEADER']}: SUA-KEY-AQUI' \\\n  -F 'file=@planta.pdf' \\\n  https://seu-app.easypanel.app/process \\\n  --output resultado.jpg",
+                'python': f"import requests\n\nheaders = {{'{CONFIG['API_KEY_HEADER']}': 'SUA-KEY-AQUI'}}\nfiles = {{'file': open('planta.pdf', 'rb')}}\n\nresponse = requests.post(\n    'https://seu-app.easypanel.app/process',\n    headers=headers,\n    files=files\n)\n\nwith open('resultado.jpg', 'wb') as f:\n    f.write(response.content)",
+                'javascript': f"const formData = new FormData();\nformData.append('file', fileInput.files[0]);\n\nfetch('https://seu-app.easypanel.app/process', {{\n  method: 'POST',\n  headers: {{\n    '{CONFIG['API_KEY_HEADER']}': 'SUA-KEY-AQUI'\n  }},\n  body: formData\n}})\n.then(res => res.blob())\n.then(blob => {{\n  const url = URL.createObjectURL(blob);\n  const a = document.createElement('a');\n  a.href = url;\n  a.download = 'resultado.jpg';\n  a.click();\n}});"
+            },
+            'generate_key': {
+                'curl': f"curl -X POST \\\n  -H '{CONFIG['API_KEY_HEADER']}: SUA-KEY-ADMIN' \\\n  https://seu-app.easypanel.app/generate-key"
+            }
+        },
+        'config': {
+            'processing': {
+                'max_file_mb': CONFIG['MAX_CONTENT_LENGTH'] / (1024 * 1024),
+                'min_dimension': CONFIG['MIN_DIMENSION'],
+                'max_dimension': CONFIG['MAX_DIMENSION'],
+                'pdf_dpi': CONFIG['PDF_DPI'],
+                'jpeg_quality': CONFIG['JPEG_QUALITY']
+            },
+            'line_detection': {
+                'enabled': CONFIG['ENABLE_LINE_CLEANUP'],
+                'overlap_threshold': CONFIG['LINE_OVERLAP_THRESHOLD'],
+                'min_text_density': CONFIG['LINE_MIN_TEXT_DENSITY'],
+                'min_pixels_overlap': CONFIG['LINE_MIN_PIXELS_OVERLAP'],
+                'min_line_length': CONFIG['LINE_MIN_LENGTH']
+            }
+        },
+        'environment_variables': {
+            'required': ['API_KEYS'],
+            'security': [
+                'API_KEY_HEADER',
+                'RATE_LIMIT_PER_MINUTE',
+                'RATE_LIMIT_PER_HOUR',
+                'RATE_LIMIT_PER_DAY'
+            ],
+            'processing': [
+                'MAX_CONTENT_LENGTH',
+                'MIN_DIMENSION',
+                'MAX_DIMENSION',
+                'PDF_DPI',
+                'JPEG_QUALITY'
+            ],
+            'line_detection': [
+                'ENABLE_LINE_CLEANUP',
+                'LINE_OVERLAP_THRESHOLD',
+                'LINE_MIN_TEXT_DENSITY',
+                'LINE_MIN_PIXELS_OVERLAP',
+                'LINE_MIN_LENGTH'
+            ],
+            'redis': [
+                'REDIS_URL',
+                'REDIS_HOST',
+                'REDIS_PORT',
+                'REDIS_PASSWORD',
+                'REDIS_DB'
+            ]
+        }
+    }), 200
 
 @app.route('/generate-key', methods=['POST'])
-@require_api_key
+@require_api_key  # Protegido - requer API Key
 def generate_key():
     """Gera nova API key (protegido - só admin pode gerar)"""
     new_key = generate_api_key()
+    
+    # Formata exemplo de como adicionar a nova key
+    current_keys = ','.join(CONFIG['API_KEYS'][:1])  # Mostra apenas a primeira key por segurança
+    
     return jsonify({
+        'success': True,
         'api_key': new_key,
-        'message': f'Adicione esta key em API_KEYS no Easypanel',
-        'example': f'API_KEYS={CONFIG["API_KEYS"][0] if CONFIG["API_KEYS"] else ""},{new_key}'
+        'message': 'Nova API Key gerada com sucesso',
+        'instructions': {
+            'step_1': 'Copie a API Key acima',
+            'step_2': 'Vá no Easypanel → Seu App → Environment Variables',
+            'step_3': f'Adicione ao final de API_KEYS: {current_keys},...,{new_key}',
+            'step_4': 'Reinicie o serviço'
+        },
+        'example': f'API_KEYS={current_keys},{new_key}'
     }), 200
 
 @app.route('/process', methods=['POST'])
-@require_api_key  # PROTEGIDO por API Key
+@require_api_key  # Protegido - requer API Key
 @limiter.limit(
     f"{CONFIG['RATE_LIMIT_PER_MINUTE']} per minute;"
     f"{CONFIG['RATE_LIMIT_PER_HOUR']} per hour;"
     f"{CONFIG['RATE_LIMIT_PER_DAY']} per day"
 )
 def process_file():
-    """Endpoint principal - REQUER API KEY"""
+    """
+    Endpoint principal - Processa PDF ou imagem
+    REQUER API KEY no header X-API-Key (ou configurado)
+    """
     if 'file' not in request.files:
-        return jsonify({'error': 'Nenhum arquivo enviado'}), 400
+        return jsonify({
+            'error': 'Nenhum arquivo enviado',
+            'message': 'Envie um arquivo usando o campo "file"'
+        }), 400
     
     file = request.files['file']
     
     if not file.filename:
-        return jsonify({'error': 'Nome de arquivo vazio'}), 400
+        return jsonify({
+            'error': 'Nome de arquivo vazio',
+            'message': 'O arquivo enviado não possui um nome válido'
+        }), 400
     
     try:
         filename, buffer, mime_type = secure_validation(file)
@@ -651,67 +794,18 @@ def process_file():
         )
         
     except ValueError as e:
-        logger.warning(f"⚠️  Validação: {e}")
-        return jsonify({'error': str(e)}), 400
+        logger.warning(f"⚠️  Validação falhou: {e}")
+        return jsonify({
+            'error': 'Validação falhou',
+            'message': str(e)
+        }), 400
         
     except Exception as e:
-        logger.error(f"❌ Erro: {e}", exc_info=True)
-        return jsonify({'error': 'Erro ao processar arquivo'}), 500
-
-@app.route('/', methods=['GET'])
-def index():
-    """Documentação - SEM autenticação"""
-    return jsonify({
-        'service': 'PDF/Image Processor',
-        'version': '3.4',
-        'status': 'production-ready',
-        'improvements_v3.4': [
-            '🔐 API Key obrigatória (sempre habilitada)',
-            '🚦 Rate limiting avançado por IP (min/hora/dia)',
-            '📊 Headers X-RateLimit-* informativos',
-            '🔑 Endpoint /generate-key para criar novas keys',
-            '⚡ Detecção de linhas configurável',
-            '🛡️ Constant-time key comparison (timing attack protection)'
-        ],
-        'security': {
-            'api_key_required': True,
-            'api_key_header': CONFIG['API_KEY_HEADER'],
-            'api_keys_configured': len(CONFIG['API_KEYS']),
-            'rate_limits': {
-                'per_minute': CONFIG['RATE_LIMIT_PER_MINUTE'],
-                'per_hour': CONFIG['RATE_LIMIT_PER_HOUR'],
-                'per_day': CONFIG['RATE_LIMIT_PER_DAY']
-            }
-        },
-        'endpoints': {
-            'POST /process': {
-                'description': 'Processa PDF ou imagem',
-                'authentication': f'API Key no header {CONFIG["API_KEY_HEADER"]}',
-                'rate_limit': f"{CONFIG['RATE_LIMIT_PER_MINUTE']}/min",
-                'formats': list(ALLOWED_MIMES)
-            },
-            'POST /generate-key': {
-                'description': 'Gera nova API key',
-                'authentication': 'API Key (admin)',
-                'protected': True
-            },
-            'GET /health': 'Health check (público)',
-            'GET /ready': 'Readiness check (público)',
-            'GET /': 'Documentação (público)'
-        },
-        'usage_example': {
-            'curl': f"curl -X POST -H '{CONFIG['API_KEY_HEADER']}: SUA-KEY-AQUI' -F 'file=@planta.pdf' https://seu-app/process --output resultado.jpg",
-            'python': f"headers = {{'{CONFIG['API_KEY_HEADER']}': 'SUA-KEY-AQUI'}}\nfiles = {{'file': open('planta.pdf', 'rb')}}\nresponse = requests.post('https://seu-app/process', headers=headers, files=files)"
-        },
-        'environment': {
-            'required': ['API_KEYS'],
-            'optional': [
-                'API_KEY_HEADER', 'RATE_LIMIT_PER_MINUTE',
-                'RATE_LIMIT_PER_HOUR', 'RATE_LIMIT_PER_DAY',
-                'ENABLE_LINE_CLEANUP', 'LINE_OVERLAP_THRESHOLD'
-            ]
-        }
-    }), 200
+        logger.error(f"❌ Erro ao processar: {e}", exc_info=True)
+        return jsonify({
+            'error': 'Erro ao processar arquivo',
+            'message': 'Ocorreu um erro interno ao processar o arquivo'
+        }), 500
 
 # ============================================================================
 # GUNICORN HOOKS
