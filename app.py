@@ -51,7 +51,7 @@ ALLOWED_MIMES = {
 }
 
 # ============================================================================
-# REDIS CONFIGURATION (adicione após CONFIG)
+# REDIS CONFIGURATION
 # ============================================================================
 
 def get_redis_url():
@@ -75,19 +75,6 @@ def get_redis_url():
     else:
         return f"redis://{redis_host}:{redis_port}/{redis_db}"
 
-# Use a função
-redis_url = get_redis_url()
-
-# Rate Limiter com Redis configurado
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=[f"{os.getenv('RATE_LIMIT_PER_HOUR', 200)} per hour"],
-    storage_uri=redis_url,
-    strategy="fixed-window"
-)
-
-
 # ============================================================================
 # INICIALIZAÇÃO FLASK
 # ============================================================================
@@ -96,7 +83,7 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = CONFIG['MAX_CONTENT_LENGTH']
 
 # Redis URL configurável via ENV
-redis_url = os.getenv('REDIS_URL', 'memory://')
+redis_url = get_redis_url()
 
 # Rate Limiter com Redis ou Memory
 limiter = Limiter(
@@ -442,11 +429,6 @@ def readiness_check():
 def process_file():
     """
     Endpoint principal - VERSÃO FINAL OTIMIZADA
-    - Validação ANTES de salvar (buffer 8KB)
-    - Processamento em memória (sem race condition)
-    - MedianBlur no canal L (25% mais rápido)
-    - Sem gc.collect() forçado
-    - Validação de dimensões corrigida (sem *2)
     """
     
     if 'file' not in request.files:
@@ -458,7 +440,6 @@ def process_file():
         return jsonify({'error': 'Nome de arquivo vazio'}), 400
     
     try:
-        # ✅ ETAPA 1: Validação ANTES de salvar (8KB buffer)
         filename, buffer, mime_type = secure_validation(file)
         
         logger.info(
@@ -466,10 +447,8 @@ def process_file():
             f"({len(buffer) / 1024:.1f}KB, {mime_type})"
         )
         
-        # ✅ ETAPA 2: Processa em memória
         output_buffer = process_to_memory(buffer, mime_type)
         
-        # ✅ ETAPA 3: Retorna direto da memória
         return send_file(
             output_buffer,
             mimetype='image/jpeg',
@@ -530,16 +509,10 @@ def index():
             'redis_url': redis_url,
             'log_level': log_level,
             'configurable_via': [
-                'MAX_CONTENT_LENGTH',
-                'MIN_DIMENSION',
-                'MAX_DIMENSION',
-                'PDF_DPI',
-                'JPEG_QUALITY',
-                'REDIS_URL',
-                'RATE_LIMIT_PER_MINUTE',
-                'RATE_LIMIT_PER_HOUR',
-                'GUNICORN_WORKERS',
-                'GUNICORN_TIMEOUT'
+                'MAX_CONTENT_LENGTH', 'MIN_DIMENSION', 'MAX_DIMENSION',
+                'PDF_DPI', 'JPEG_QUALITY', 'REDIS_HOST', 'REDIS_PORT',
+                'REDIS_PASSWORD', 'RATE_LIMIT_PER_MINUTE',
+                'RATE_LIMIT_PER_HOUR', 'GUNICORN_WORKERS', 'GUNICORN_TIMEOUT'
             ]
         }
     }), 200
@@ -549,27 +522,21 @@ def index():
 # ============================================================================
 
 def on_starting(server):
-    """Executado quando Gunicorn inicia"""
-    logger.info("🚀 Gunicorn iniciando servidor")
+    logger.info("🚀 Gunicorn iniciando")
 
 def when_ready(server):
-    """Executado quando Gunicorn está pronto"""
-    logger.info("✅ Servidor pronto para requisições")
+    logger.info("✅ Servidor pronto")
 
 def worker_int(worker):
-    """Executado quando worker recebe SIGINT"""
-    logger.info(f"⚠️  Worker {worker.pid} recebeu SIGINT")
+    logger.info(f"⚠️  Worker {worker.pid} SIGINT")
 
 def worker_abort(worker):
-    """Executado quando worker é abortado"""
     logger.error(f"❌ Worker {worker.pid} abortado")
 
 def pre_fork(server, worker):
-    """Executado antes de criar worker"""
     logger.info(f"🔄 Criando worker")
 
 def post_fork(server, worker):
-    """Executado após criar worker"""
     logger.info(f"✅ Worker {worker.pid} iniciado")
 
 # ============================================================================
@@ -581,5 +548,4 @@ if __name__ == '__main__':
     logger.info("🚀 Servidor: http://0.0.0.0:8000")
     logger.info("📖 Produção: gunicorn --config gunicorn.conf.py app:app")
     logger.info(f"💾 RAM/request: ~{CONFIG['MAX_CONTENT_LENGTH'] * 3 / (1024**2):.0f}MB")
-    logger.info("📋 Variáveis disponíveis: ver .env.example")
     app.run(host='0.0.0.0', port=8000, debug=False, threaded=True)
