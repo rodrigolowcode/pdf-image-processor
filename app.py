@@ -1,9 +1,7 @@
 """
-PDF/Image Processor - Production Ready v3.3
+PDF/Image Processor - Production Ready v3.4
+API Key obrigatória + Rate Limiting avançado por IP
 Configurável via variáveis de ambiente do Easypanel
-Inclui detecção e limpeza de linhas com sensibilidade ajustável
-Cada request usa 2-3x o tamanho do arquivo em RAM
-Ex: 30MB JPEG → ~90-120MB RAM. Configure workers no Gunicorn conforme RAM disponível.
 """
 
 from flask import Flask, request, send_file, jsonify
@@ -24,6 +22,7 @@ import time
 from io import BytesIO
 import signal
 import sys
+import secrets
 
 # ============================================================================
 # CONFIGURAÇÕES VIA ENVIRONMENT VARIABLES
@@ -42,7 +41,7 @@ CONFIG = {
     'LOW_CONTRAST_THRESHOLD': int(os.getenv('LOW_CONTRAST_THRESHOLD', 50)),
     'MAGIC_BUFFER_SIZE': int(os.getenv('MAGIC_BUFFER_SIZE', 8192)),
     
-    # DETECÇÃO DE LINHAS (NOVO)
+    # DETECÇÃO DE LINHAS
     'ENABLE_LINE_CLEANUP': os.getenv('ENABLE_LINE_CLEANUP', 'false').lower() == 'true',
     'LINE_OVERLAP_THRESHOLD': int(os.getenv('LINE_OVERLAP_THRESHOLD', 2)),
     'LINE_MIN_TEXT_DENSITY': float(os.getenv('LINE_MIN_TEXT_DENSITY', 0.01)),
@@ -54,6 +53,13 @@ CONFIG = {
     'LINE_HOUGH_MAX_GAP': int(os.getenv('LINE_HOUGH_MAX_GAP', 10)),
     'LINE_CANNY_LOW': int(os.getenv('LINE_CANNY_LOW', 40)),
     'LINE_CANNY_HIGH': int(os.getenv('LINE_CANNY_HIGH', 120)),
+    
+    # SEGURANÇA (API KEY OBRIGATÓRIA)
+    'API_KEYS': [k.strip() for k in os.getenv('API_KEYS', '').split(',') if k.strip()],
+    'API_KEY_HEADER': os.getenv('API_KEY_HEADER', 'X-API-Key'),
+    'RATE_LIMIT_PER_MINUTE': int(os.getenv('RATE_LIMIT_PER_MINUTE', 10)),
+    'RATE_LIMIT_PER_HOUR': int(os.getenv('RATE_LIMIT_PER_HOUR', 100)),
+    'RATE_LIMIT_PER_DAY': int(os.getenv('RATE_LIMIT_PER_DAY', 1000)),
 }
 
 ALLOWED_MIMES = {
@@ -69,9 +75,7 @@ ALLOWED_MIMES = {
 # ============================================================================
 
 def get_redis_url():
-    """
-    Constrói Redis URL a partir de variáveis individuais ou usa URL completa
-    """
+    """Constrói Redis URL"""
     redis_url = os.getenv('REDIS_URL')
     if redis_url:
         return redis_url
@@ -95,12 +99,18 @@ app.config['MAX_CONTENT_LENGTH'] = CONFIG['MAX_CONTENT_LENGTH']
 
 redis_url = get_redis_url()
 
+# Rate Limiter com limites configuráveis
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
-    default_limits=[f"{os.getenv('RATE_LIMIT_PER_HOUR', 200)} per hour"],
+    default_limits=[
+        f"{CONFIG['RATE_LIMIT_PER_MINUTE']} per minute",
+        f"{CONFIG['RATE_LIMIT_PER_HOUR']} per hour",
+        f"{CONFIG['RATE_LIMIT_PER_DAY']} per day"
+    ],
     storage_uri=redis_url,
-    strategy="fixed-window"
+    strategy="fixed-window",
+    headers_enabled=True
 )
 
 log_level = os.getenv('LOG_LEVEL', 'INFO')
@@ -113,7 +123,7 @@ logger = logging.getLogger(__name__)
 
 # Log de inicialização
 logger.info("=" * 80)
-logger.info("🚀 PDF/Image Processor v3.3 iniciando")
+logger.info("🚀 PDF/Image Processor v3.4 iniciando")
 logger.info(f"📊 Configurações:")
 logger.info(f"   • Max file size: {CONFIG['MAX_CONTENT_LENGTH'] / (1024**2):.0f}MB")
 logger.info(f"   • Min dimension: {CONFIG['MIN_DIMENSION']}px")
@@ -125,13 +135,19 @@ if CONFIG['ENABLE_LINE_CLEANUP']:
     logger.info(f"🔧 Detecção de linhas: HABILITADA")
     logger.info(f"   • Overlap threshold: {CONFIG['LINE_OVERLAP_THRESHOLD']}")
     logger.info(f"   • Text density min: {CONFIG['LINE_MIN_TEXT_DENSITY']:.3f}")
-    logger.info(f"   • Pixels overlap min: {CONFIG['LINE_MIN_PIXELS_OVERLAP']}")
-    logger.info(f"   • Line min length: {CONFIG['LINE_MIN_LENGTH']}px")
 else:
     logger.info(f"🔧 Detecção de linhas: DESABILITADA")
 
+logger.info(f"🔐 API Key: OBRIGATÓRIA")
+logger.info(f"   • Keys configuradas: {len(CONFIG['API_KEYS'])}")
+logger.info(f"   • Header: {CONFIG['API_KEY_HEADER']}")
+
+if not CONFIG['API_KEYS']:
+    logger.error("❌ NENHUMA API KEY CONFIGURADA! Serviço não funcionará.")
+    logger.error("   Configure API_KEYS no Easypanel")
+
 logger.info(f"🔗 Redis: {redis_url}")
-logger.info(f"🚦 Rate limits: {os.getenv('RATE_LIMIT_PER_MINUTE', 10)}/min, {os.getenv('RATE_LIMIT_PER_HOUR', 100)}/hour")
+logger.info(f"🚦 Rate limits: {CONFIG['RATE_LIMIT_PER_MINUTE']}/min, {CONFIG['RATE_LIMIT_PER_HOUR']}/hour, {CONFIG['RATE_LIMIT_PER_DAY']}/day")
 logger.info(f"📝 Log level: {log_level}")
 logger.info("=" * 80)
 
@@ -148,6 +164,61 @@ signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
 
 # ============================================================================
+# SEGURANÇA - API KEY (OBRIGATÓRIA)
+# ============================================================================
+
+def require_api_key(f):
+    """
+    Decorator para proteger endpoints com API Key (OBRIGATÓRIA)
+    Verifica header X-API-Key (ou configurado via API_KEY_HEADER)
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # API Key sempre obrigatória
+        if not CONFIG['API_KEYS']:
+            logger.error("🚫 Nenhuma API Key configurada no servidor")
+            return jsonify({
+                'error': 'Serviço não configurado',
+                'message': 'Servidor sem API Keys configuradas'
+            }), 503
+        
+        # Obtém API key do header
+        api_key = request.headers.get(CONFIG['API_KEY_HEADER'])
+        
+        if not api_key:
+            logger.warning(
+                f"⚠️  Tentativa sem API Key de {get_remote_address()} "
+                f"para {request.path}"
+            )
+            return jsonify({
+                'error': 'API Key obrigatória',
+                'message': f'Forneça a API Key no header {CONFIG["API_KEY_HEADER"]}'
+            }), 401
+        
+        # Valida API key (constant-time comparison)
+        valid = False
+        for valid_key in CONFIG['API_KEYS']:
+            if secrets.compare_digest(api_key, valid_key):
+                valid = True
+                break
+        
+        if not valid:
+            logger.warning(
+                f"🚫 API Key inválida de {get_remote_address()} "
+                f"para {request.path}: {api_key[:8]}..."
+            )
+            return jsonify({
+                'error': 'API Key inválida',
+                'message': 'A API Key fornecida não é válida'
+            }), 403
+        
+        # API Key válida
+        logger.debug(f"✅ API Key válida de {get_remote_address()}")
+        return f(*args, **kwargs)
+    
+    return decorated_function
+
+# ============================================================================
 # UTILITÁRIOS
 # ============================================================================
 
@@ -162,11 +233,12 @@ def timeit(func):
         return result
     return wrapper
 
+def generate_api_key() -> str:
+    """Gera uma API key segura de 32 bytes (64 caracteres hex)"""
+    return secrets.token_hex(32)
+
 def secure_validation(file: FileStorage) -> Tuple[str, bytes, str]:
-    """
-    Valida arquivo ANTES de salvar em disco
-    Retorna nome seguro, buffer validado e mime type
-    """
+    """Valida arquivo ANTES de salvar"""
     file.stream.seek(0, os.SEEK_END)
     size = file.stream.tell()
     
@@ -184,21 +256,16 @@ def secure_validation(file: FileStorage) -> Tuple[str, bytes, str]:
     
     try:
         import magic
-        mime = magic.from_buffer(
-            buffer[:CONFIG['MAGIC_BUFFER_SIZE']], 
-            mime=True
-        )
+        mime = magic.from_buffer(buffer[:CONFIG['MAGIC_BUFFER_SIZE']], mime=True)
         logger.info(f"🔍 MIME detectado: {mime}")
     except ImportError:
         logger.warning("⚠️  python-magic não disponível, usando fallback")
         ext = Path(file.filename).suffix.lower()
         mime_map = {
             '.pdf': 'application/pdf',
-            '.jpg': 'image/jpeg',
-            '.jpeg': 'image/jpeg',
+            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
             '.png': 'image/png',
-            '.tiff': 'image/tiff',
-            '.tif': 'image/tiff',
+            '.tiff': 'image/tiff', '.tif': 'image/tiff',
             '.bmp': 'image/bmp'
         }
         mime = mime_map.get(ext)
@@ -212,19 +279,15 @@ def secure_validation(file: FileStorage) -> Tuple[str, bytes, str]:
     return secure_filename(file.filename), buffer, mime
 
 # ============================================================================
-# DETECÇÃO E LIMPEZA DE LINHAS SOBRE TEXTO
+# DETECÇÃO E LIMPEZA DE LINHAS (código mantido do v3.3)
 # ============================================================================
 
 @timeit
 def detect_text_line_overlap_production(image: np.ndarray) -> dict:
-    """
-    VERSÃO PRODUÇÃO v3.3 - COM SENSIBILIDADE CONFIGURÁVEL
-    Detecta linhas sobre texto usando parâmetros do CONFIG
-    """
+    """Detecta linhas sobre texto"""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape
     
-    # Downscale adaptativo
     if max(height, width) > 4000:
         scale = 0.4
     elif min(height, width) > 2000:
@@ -233,96 +296,60 @@ def detect_text_line_overlap_production(image: np.ndarray) -> dict:
         scale = 1.0
     
     gray_analysis = gray if scale == 1.0 else cv2.resize(
-        gray, None, fx=scale, fy=scale,
-        interpolation=cv2.INTER_AREA
+        gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
     )
     
-    # Detecção de texto
     blur = cv2.GaussianBlur(gray_analysis, (3, 3), 0)
     text_mask = cv2.adaptiveThreshold(
-        blur, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        11, 2
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
     )
     
-    # Early return por densidade de texto (CONFIGURÁVEL)
     text_density = np.sum(text_mask > 0) / text_mask.size
     if text_density < CONFIG['LINE_MIN_TEXT_DENSITY']:
-        logger.info(
-            f"✅ Densidade de texto {text_density:.1%} < "
-            f"{CONFIG['LINE_MIN_TEXT_DENSITY']:.1%} (scale={scale:.2f}), skip"
-        )
+        logger.info(f"✅ Densidade {text_density:.1%} < {CONFIG['LINE_MIN_TEXT_DENSITY']:.1%}, skip")
         return {
-            'has_problem': False,
-            'overlap_score': 0,
-            'severity': 'none',
-            'problem_lines': [],
-            'scale_used': scale,
-            'total_lines_detected': 0,
-            'text_density': float(text_density)
+            'has_problem': False, 'overlap_score': 0, 'severity': 'none',
+            'problem_lines': [], 'scale_used': scale,
+            'total_lines_detected': 0, 'text_density': float(text_density)
         }
     
-    # Dilata texto
     kernel_size = max(2, int(2 * scale))
-    text_mask_expanded = cv2.dilate(
-        text_mask, 
-        np.ones((kernel_size, kernel_size), np.uint8)
-    )
+    text_mask_expanded = cv2.dilate(text_mask, np.ones((kernel_size, kernel_size), np.uint8))
     
-    # Detecção de linhas (PARÂMETROS CONFIGURÁVEIS)
     canny_low = max(30, int(CONFIG['LINE_CANNY_LOW'] * scale))
     canny_high = max(100, int(CONFIG['LINE_CANNY_HIGH'] * scale))
     edges = cv2.Canny(gray_analysis, canny_low, canny_high)
     
     hough_threshold = max(50, int(CONFIG['LINE_HOUGH_THRESHOLD'] * scale))
     lines = cv2.HoughLinesP(
-        edges, 1, np.pi/180, 
-        hough_threshold,
+        edges, 1, np.pi/180, hough_threshold,
         minLineLength=int(CONFIG['LINE_HOUGH_MIN_LENGTH'] * scale),
         maxLineGap=int(CONFIG['LINE_HOUGH_MAX_GAP'] * scale)
     )
     
     if lines is None:
-        logger.info(f"✅ Nenhuma linha detectada (scale={scale:.2f})")
         return {
-            'has_problem': False,
-            'overlap_score': 0,
-            'severity': 'none',
-            'problem_lines': [],
-            'scale_used': scale,
-            'total_lines_detected': 0,
-            'text_density': float(text_density)
+            'has_problem': False, 'overlap_score': 0, 'severity': 'none',
+            'problem_lines': [], 'scale_used': scale,
+            'total_lines_detected': 0, 'text_density': float(text_density)
         }
     
-    # Filtra e ordena (COMPRIMENTO MÍNIMO CONFIGURÁVEL)
     def line_length_squared(line):
         x1, y1, x2, y2 = line[0]
         return (x2 - x1)**2 + (y2 - y1)**2
     
     min_length_sq = (CONFIG['LINE_MIN_LENGTH'] * scale)**2
-    lines_filtered = [l for l in lines 
-                      if line_length_squared(l) >= min_length_sq]
+    lines_filtered = [l for l in lines if line_length_squared(l) >= min_length_sq]
     
     if not lines_filtered:
-        logger.info(f"✅ Apenas linhas curtas (scale={scale:.2f})")
         return {
-            'has_problem': False,
-            'overlap_score': 0,
-            'severity': 'none',
-            'problem_lines': [],
-            'scale_used': scale,
-            'total_lines_detected': 0,
-            'text_density': float(text_density)
+            'has_problem': False, 'overlap_score': 0, 'severity': 'none',
+            'problem_lines': [], 'scale_used': scale,
+            'total_lines_detected': 0, 'text_density': float(text_density)
         }
     
-    sorted_lines = sorted(
-        lines_filtered,
-        key=line_length_squared,
-        reverse=True
-    )
+    sorted_lines = sorted(lines_filtered, key=line_length_squared, reverse=True)
     
-    # Verifica overlap (THRESHOLDS CONFIGURÁVEIS)
     overlap_score = 0
     problem_lines = []
     
@@ -336,7 +363,6 @@ def detect_text_line_overlap_production(image: np.ndarray) -> dict:
         overlap = cv2.bitwise_and(text_mask_expanded, line_mask)
         overlap_pixels = np.sum(overlap > 0)
         
-        # Threshold adaptativo (CONFIGURÁVEL)
         threshold = max(
             CONFIG['LINE_MIN_PIXELS_OVERLAP'],
             int(line_length * CONFIG['LINE_OVERLAP_PERCENTAGE'])
@@ -344,172 +370,103 @@ def detect_text_line_overlap_production(image: np.ndarray) -> dict:
         
         if overlap_pixels > threshold:
             overlap_score += 1
-            
             problem_lines.append({
                 'coords': tuple(int(c / scale) for c in (x1, y1, x2, y2)),
                 'overlap_pixels': int(overlap_pixels / (scale**2)),
                 'length': line_length / scale,
                 'threshold_used': int(threshold / scale)
             })
-            
             if overlap_score > 5:
                 break
     
-    # Validação de coordenadas
     if scale < 1.0:
         for line_info in problem_lines:
             x1, y1, x2, y2 = line_info['coords']
             line_info['coords'] = (
-                max(0, min(x1, width - 1)),
-                max(0, min(y1, height - 1)),
-                max(0, min(x2, width - 1)),
-                max(0, min(y2, height - 1))
+                max(0, min(x1, width - 1)), max(0, min(y1, height - 1)),
+                max(0, min(x2, width - 1)), max(0, min(y2, height - 1))
             )
     
-    # Decisão final (THRESHOLD CONFIGURÁVEL)
     has_problem = overlap_score > CONFIG['LINE_OVERLAP_THRESHOLD']
     severity = ('none' if overlap_score <= 1 else
                 'moderate' if overlap_score <= 3 else 'severe')
     
     if has_problem:
-        logger.info(
-            f"⚠️  Overlap: score={overlap_score} (threshold={CONFIG['LINE_OVERLAP_THRESHOLD']}), "
-            f"severity={severity}, scale={scale:.2f}, density={text_density:.1%}, "
-            f"lines={len(problem_lines)}/{len(sorted_lines)}"
-        )
-    else:
-        logger.info(
-            f"✅ Sem overlap (score={overlap_score}, threshold={CONFIG['LINE_OVERLAP_THRESHOLD']}, "
-            f"scale={scale:.2f}, density={text_density:.1%})"
-        )
+        logger.info(f"⚠️  Overlap: score={overlap_score}, severity={severity}")
     
     return {
-        'has_problem': has_problem,
-        'overlap_score': overlap_score,
-        'severity': severity,
-        'problem_lines': problem_lines,
-        'scale_used': scale,
-        'total_lines_detected': len(sorted_lines),
+        'has_problem': has_problem, 'overlap_score': overlap_score,
+        'severity': severity, 'problem_lines': problem_lines,
+        'scale_used': scale, 'total_lines_detected': len(sorted_lines),
         'text_density': float(text_density)
     }
 
 
 @timeit
 def clean_lines_over_text_production(image: np.ndarray, detection_result: dict) -> np.ndarray:
-    """
-    VERSÃO PRODUÇÃO v3.3
-    Remove linhas detectadas via inpainting
-    """
-    
-    if not detection_result.get('problem_lines'):
-        logger.warning("⚠️  Nenhuma linha para limpar")
-        return image
-    
-    if not detection_result.get('has_problem'):
-        logger.info("✅ has_problem=False, skip limpeza")
+    """Remove linhas detectadas via inpainting"""
+    if not detection_result.get('problem_lines') or not detection_result.get('has_problem'):
         return image
     
     height, width = image.shape[:2]
-    
     lines_mask = np.zeros((height, width), dtype=np.uint8)
     valid_lines = 0
     
     for line_info in detection_result['problem_lines']:
         x1, y1, x2, y2 = line_info['coords']
-        
         x1 = max(0, min(x1, width - 1))
         y1 = max(0, min(y1, height - 1))
         x2 = max(0, min(x2, width - 1))
         y2 = max(0, min(y2, height - 1))
         
         if x1 == x2 and y1 == y2:
-            logger.warning(f"⚠️  Linha colapsou: {line_info['coords']}")
             continue
         
         length = line_info['length']
-        if length > 300:
-            thickness = 5
-        elif length > 150:
-            thickness = 4
-        else:
-            thickness = 3
-        
+        thickness = 5 if length > 300 else 4 if length > 150 else 3
         cv2.line(lines_mask, (x1, y1), (x2, y2), 255, thickness)
         valid_lines += 1
     
     if valid_lines == 0:
-        logger.warning("⚠️  Nenhuma linha válida")
         return image
     
-    lines_mask = cv2.dilate(
-        lines_mask,
-        np.ones((2, 2), np.uint8),
-        iterations=1
-    )
+    lines_mask = cv2.dilate(lines_mask, np.ones((2, 2), np.uint8), iterations=1)
     
     severity = detection_result.get('severity', 'moderate')
-    
     if severity == 'moderate':
-        radius = 3
-        result = cv2.inpaint(
-            image, lines_mask,
-            inpaintRadius=radius,
-            flags=cv2.INPAINT_TELEA
-        )
+        result = cv2.inpaint(image, lines_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
         method = 'BGR'
     else:
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        
-        radius = 5
-        l_clean = cv2.inpaint(
-            l, lines_mask,
-            inpaintRadius=radius,
-            flags=cv2.INPAINT_TELEA
-        )
-        
+        l_clean = cv2.inpaint(l, lines_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
         result = cv2.cvtColor(cv2.merge([l_clean, a, b]), cv2.COLOR_LAB2BGR)
         method = 'LAB'
     
-    pixels_cleaned = np.sum(lines_mask > 0)
-    logger.info(
-        f"🧹 Limpeza: {valid_lines} linhas, {pixels_cleaned}px, "
-        f"method={method}, radius={radius}"
-    )
-    
+    logger.info(f"🧹 Limpeza: {valid_lines} linhas, method={method}")
     return result
 
 # ============================================================================
-# PROCESSAMENTO DE IMAGENS
+# PROCESSAMENTO DE IMAGENS (código mantido do v3.3)
 # ============================================================================
 
 @timeit
 def optimize_for_cpu(image: np.ndarray) -> np.ndarray:
-    """
-    Pipeline otimizado v3.3
-    Ordem: CLAHE → Upscale/Downscale → [Limpeza] → Denoise → Sharpen
-    """
-    
-    # 1. CLAHE
+    """Pipeline otimizado v3.4"""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
     
     if laplacian_var < CONFIG['LOW_CONTRAST_THRESHOLD']:
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        
         clahe = cv2.createCLAHE(
             clipLimit=CONFIG['CLAHE_CLIP_LIMIT'],
             tileGridSize=(CONFIG['CLAHE_TILE_SIZE'], CONFIG['CLAHE_TILE_SIZE'])
         )
         l = clahe.apply(l)
-        
         image = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
         logger.info(f"✨ CLAHE aplicado (var: {laplacian_var:.2f})")
-    else:
-        logger.info(f"✅ Bom contraste (var: {laplacian_var:.2f})")
     
-    # 2. UPSCALING/DOWNSCALING
     height, width = image.shape[:2]
     min_dim = min(height, width)
     max_dim = max(height, width)
@@ -518,84 +475,53 @@ def optimize_for_cpu(image: np.ndarray) -> np.ndarray:
         scale = CONFIG['MIN_DIMENSION'] / min_dim
         new_width = int(min(width * scale, CONFIG['MAX_DIMENSION']))
         new_height = int(min(height * scale, CONFIG['MAX_DIMENSION']))
-        
-        image = cv2.resize(
-            image, (new_width, new_height),
-            interpolation=cv2.INTER_LINEAR
-        )
+        image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
         logger.info(f"📐 Upscaled: {new_width}x{new_height}")
-        
     elif max_dim > CONFIG['MAX_DIMENSION']:
         scale = CONFIG['MAX_DIMENSION'] / max_dim
         new_width = int(width * scale)
         new_height = int(height * scale)
-        
-        image = cv2.resize(
-            image, (new_width, new_height),
-            interpolation=cv2.INTER_AREA
-        )
+        image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
         logger.info(f"📉 Downscaled: {new_width}x{new_height}")
     
-    # 3. DETECÇÃO E LIMPEZA (OPCIONAL)
     if CONFIG['ENABLE_LINE_CLEANUP']:
         detection = detect_text_line_overlap_production(image)
-        
         if detection['has_problem']:
-            logger.info(
-                f"🔧 Limpeza: score={detection['overlap_score']}, "
-                f"severity={detection['severity']}"
-            )
             image = clean_lines_over_text_production(image, detection)
-        else:
-            logger.info("✅ Sem linhas problemáticas")
     
-    # 4. DENOISING
     if laplacian_var < CONFIG['NOISE_THRESHOLD']:
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         l = cv2.medianBlur(l, CONFIG['MEDIAN_KERNEL'])
         image = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-        logger.info(f"🧹 MedianBlur aplicado no canal L")
+        logger.info("🧹 MedianBlur aplicado")
     
-    # 5. SHARPENING
     blurred = cv2.GaussianBlur(image, (0, 0), 3.0)
-    sharpening_amount = 0.8
-    image = cv2.addWeighted(
-        image, 1.0 + sharpening_amount,
-        blurred, -sharpening_amount,
-        0
-    )
+    image = cv2.addWeighted(image, 1.8, blurred, -0.8, 0)
     logger.info("🔪 Sharpening aplicado")
     
     return image
 
 @timeit
 def convert_pdf_to_image(pdf_buffer: bytes) -> np.ndarray:
-    """Converte PDF buffer para imagem"""
+    """Converte PDF para imagem"""
     with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
         tmp.write(pdf_buffer)
         tmp_path = tmp.name
     
     try:
         images = convert_from_path(
-            tmp_path, dpi=CONFIG['PDF_DPI'],
-            first_page=1, last_page=1,
-            fmt='jpeg', thread_count=2,
-            use_pdftocairo=True, grayscale=False
+            tmp_path, dpi=CONFIG['PDF_DPI'], first_page=1, last_page=1,
+            fmt='jpeg', thread_count=2, use_pdftocairo=True, grayscale=False
         )
-        
         if not images:
             raise ValueError("PDF vazio ou corrompido")
-        
-        image_array = cv2.cvtColor(np.array(images[0]), cv2.COLOR_RGB2BGR)
-        logger.info(f"📄 PDF convertido: {image_array.shape}")
-        return image_array
-        
+        return cv2.cvtColor(np.array(images[0]), cv2.COLOR_RGB2BGR)
     finally:
         try:
             os.unlink(tmp_path)
-        except Exception as e:
-            logger.warning(f"Falha ao remover temp PDF: {e}")
+        except:
+            pass
 
 @timeit
 def process_to_memory(buffer: bytes, mime_type: str) -> BytesIO:
@@ -610,19 +536,12 @@ def process_to_memory(buffer: bytes, mime_type: str) -> BytesIO:
         raise ValueError("Não foi possível decodificar imagem")
     
     height, width = image.shape[:2]
-    if max(height, width) > CONFIG['MAX_DIMENSION']:
-        raise ValueError(
-            f"Dimensões muito grandes: {width}x{height}px. "
-            f"Máximo: {CONFIG['MAX_DIMENSION']}px"
-        )
-    
     logger.info(f"📊 Original: {width}x{height}")
     
     processed = optimize_for_cpu(image)
     
     success, buffer_encoded = cv2.imencode(
-        '.jpg', processed,
-        [cv2.IMWRITE_JPEG_QUALITY, CONFIG['JPEG_QUALITY']]
+        '.jpg', processed, [cv2.IMWRITE_JPEG_QUALITY, CONFIG['JPEG_QUALITY']]
     )
     
     if not success:
@@ -631,9 +550,7 @@ def process_to_memory(buffer: bytes, mime_type: str) -> BytesIO:
     output_buffer = BytesIO(buffer_encoded.tobytes())
     output_buffer.seek(0)
     
-    file_size = len(buffer_encoded) / 1024
-    logger.info(f"✅ Processado: {file_size:.1f}KB")
-    
+    logger.info(f"✅ Processado: {len(buffer_encoded) / 1024:.1f}KB")
     return output_buffer
 
 # ============================================================================
@@ -665,34 +582,49 @@ def internal_error(error):
 
 @app.route('/health', methods=['GET'])
 def health_check():
+    """Health check - SEM autenticação"""
     return jsonify({
         'status': 'healthy',
         'service': 'pdf-image-processor',
-        'version': '3.3',
+        'version': '3.4',
         'worker_pid': os.getpid(),
         'redis': redis_url,
+        'security': {
+            'api_key_required': True,
+            'api_keys_configured': len(CONFIG['API_KEYS']),
+            'api_key_header': CONFIG['API_KEY_HEADER']
+        },
         'config': {
             'max_file_mb': CONFIG['MAX_CONTENT_LENGTH'] / (1024 * 1024),
-            'min_dimension': CONFIG['MIN_DIMENSION'],
-            'max_dimension': CONFIG['MAX_DIMENSION'],
-            'line_cleanup_enabled': CONFIG['ENABLE_LINE_CLEANUP'],
-            'line_detection_sensitivity': {
-                'overlap_threshold': CONFIG['LINE_OVERLAP_THRESHOLD'],
-                'min_text_density': CONFIG['LINE_MIN_TEXT_DENSITY'],
-                'min_pixels_overlap': CONFIG['LINE_MIN_PIXELS_OVERLAP'],
-                'min_line_length': CONFIG['LINE_MIN_LENGTH']
-            }
+            'line_cleanup_enabled': CONFIG['ENABLE_LINE_CLEANUP']
         }
     }), 200
 
 @app.route('/ready', methods=['GET'])
 def readiness_check():
+    """Readiness check - SEM autenticação"""
     return jsonify({'status': 'ready'}), 200
 
+@app.route('/generate-key', methods=['POST'])
+@require_api_key
+def generate_key():
+    """Gera nova API key (protegido - só admin pode gerar)"""
+    new_key = generate_api_key()
+    return jsonify({
+        'api_key': new_key,
+        'message': f'Adicione esta key em API_KEYS no Easypanel',
+        'example': f'API_KEYS={CONFIG["API_KEYS"][0] if CONFIG["API_KEYS"] else ""},{new_key}'
+    }), 200
+
 @app.route('/process', methods=['POST'])
-@limiter.limit(f"{os.getenv('RATE_LIMIT_PER_MINUTE', 10)} per minute")
-@limiter.limit(f"{os.getenv('RATE_LIMIT_PER_HOUR', 100)} per hour")
+@require_api_key  # PROTEGIDO por API Key
+@limiter.limit(
+    f"{CONFIG['RATE_LIMIT_PER_MINUTE']} per minute;"
+    f"{CONFIG['RATE_LIMIT_PER_HOUR']} per hour;"
+    f"{CONFIG['RATE_LIMIT_PER_DAY']} per day"
+)
 def process_file():
+    """Endpoint principal - REQUER API KEY"""
     if 'file' not in request.files:
         return jsonify({'error': 'Nenhum arquivo enviado'}), 400
     
@@ -705,8 +637,8 @@ def process_file():
         filename, buffer, mime_type = secure_validation(file)
         
         logger.info(
-            f"🔄 Processando: {filename} "
-            f"({len(buffer) / 1024:.1f}KB, {mime_type})"
+            f"🔄 Processando: {filename} ({len(buffer) / 1024:.1f}KB, {mime_type}) "
+            f"de {get_remote_address()}"
         )
         
         output_buffer = process_to_memory(buffer, mime_type)
@@ -728,55 +660,55 @@ def process_file():
 
 @app.route('/', methods=['GET'])
 def index():
+    """Documentação - SEM autenticação"""
     return jsonify({
         'service': 'PDF/Image Processor',
-        'version': '3.3',
+        'version': '3.4',
         'status': 'production-ready',
-        'worker_pid': os.getpid(),
-        'improvements_v3.3': [
-            'Detecção de linhas com sensibilidade configurável',
-            'Limpeza opcional via ENABLE_LINE_CLEANUP',
-            'Parâmetros ajustáveis via ENV vars',
-            'Performance otimizada com downscale adaptativo',
-            'Early return por densidade de texto',
-            'Inpainting condicional (BGR ou LAB)'
+        'improvements_v3.4': [
+            '🔐 API Key obrigatória (sempre habilitada)',
+            '🚦 Rate limiting avançado por IP (min/hora/dia)',
+            '📊 Headers X-RateLimit-* informativos',
+            '🔑 Endpoint /generate-key para criar novas keys',
+            '⚡ Detecção de linhas configurável',
+            '🛡️ Constant-time key comparison (timing attack protection)'
         ],
+        'security': {
+            'api_key_required': True,
+            'api_key_header': CONFIG['API_KEY_HEADER'],
+            'api_keys_configured': len(CONFIG['API_KEYS']),
+            'rate_limits': {
+                'per_minute': CONFIG['RATE_LIMIT_PER_MINUTE'],
+                'per_hour': CONFIG['RATE_LIMIT_PER_HOUR'],
+                'per_day': CONFIG['RATE_LIMIT_PER_DAY']
+            }
+        },
         'endpoints': {
             'POST /process': {
                 'description': 'Processa PDF ou imagem',
-                'rate_limit': f"{os.getenv('RATE_LIMIT_PER_MINUTE', 10)}/min, {os.getenv('RATE_LIMIT_PER_HOUR', 100)}/hora",
-                'max_size_mb': CONFIG['MAX_CONTENT_LENGTH'] / (1024 * 1024),
+                'authentication': f'API Key no header {CONFIG["API_KEY_HEADER"]}',
+                'rate_limit': f"{CONFIG['RATE_LIMIT_PER_MINUTE']}/min",
                 'formats': list(ALLOWED_MIMES)
             },
-            'GET /health': 'Health check',
-            'GET /ready': 'Readiness check'
+            'POST /generate-key': {
+                'description': 'Gera nova API key',
+                'authentication': 'API Key (admin)',
+                'protected': True
+            },
+            'GET /health': 'Health check (público)',
+            'GET /ready': 'Readiness check (público)',
+            'GET /': 'Documentação (público)'
         },
-        'config': {
-            'min_dimension': f"{CONFIG['MIN_DIMENSION']}px",
-            'max_dimension': f"{CONFIG['MAX_DIMENSION']}px",
-            'pdf_dpi': CONFIG['PDF_DPI'],
-            'jpeg_quality': CONFIG['JPEG_QUALITY'],
-            'line_cleanup': 'ENABLED' if CONFIG['ENABLE_LINE_CLEANUP'] else 'DISABLED'
-        },
-        'line_detection_params': {
-            'overlap_threshold': CONFIG['LINE_OVERLAP_THRESHOLD'],
-            'min_text_density': CONFIG['LINE_MIN_TEXT_DENSITY'],
-            'min_pixels_overlap': CONFIG['LINE_MIN_PIXELS_OVERLAP'],
-            'overlap_percentage': CONFIG['LINE_OVERLAP_PERCENTAGE'],
-            'min_line_length': CONFIG['LINE_MIN_LENGTH'],
-            'hough_threshold': CONFIG['LINE_HOUGH_THRESHOLD'],
-            'canny_low': CONFIG['LINE_CANNY_LOW'],
-            'canny_high': CONFIG['LINE_CANNY_HIGH']
+        'usage_example': {
+            'curl': f"curl -X POST -H '{CONFIG['API_KEY_HEADER']}: SUA-KEY-AQUI' -F 'file=@planta.pdf' https://seu-app/process --output resultado.jpg",
+            'python': f"headers = {{'{CONFIG['API_KEY_HEADER']}': 'SUA-KEY-AQUI'}}\nfiles = {{'file': open('planta.pdf', 'rb')}}\nresponse = requests.post('https://seu-app/process', headers=headers, files=files)"
         },
         'environment': {
-            'redis_url': redis_url,
-            'log_level': log_level,
-            'configurable_via': [
-                'MAX_CONTENT_LENGTH', 'MIN_DIMENSION', 'MAX_DIMENSION',
-                'PDF_DPI', 'JPEG_QUALITY', 'ENABLE_LINE_CLEANUP',
-                'LINE_OVERLAP_THRESHOLD', 'LINE_MIN_TEXT_DENSITY',
-                'LINE_MIN_PIXELS_OVERLAP', 'LINE_MIN_LENGTH',
-                'REDIS_URL', 'RATE_LIMIT_PER_MINUTE', 'RATE_LIMIT_PER_HOUR'
+            'required': ['API_KEYS'],
+            'optional': [
+                'API_KEY_HEADER', 'RATE_LIMIT_PER_MINUTE',
+                'RATE_LIMIT_PER_HOUR', 'RATE_LIMIT_PER_DAY',
+                'ENABLE_LINE_CLEANUP', 'LINE_OVERLAP_THRESHOLD'
             ]
         }
     }), 200
@@ -791,28 +723,24 @@ def on_starting(server):
 def when_ready(server):
     logger.info("✅ Servidor pronto")
 
-def worker_int(worker):
-    logger.info(f"⚠️  Worker {worker.pid} SIGINT")
-
-def worker_abort(worker):
-    logger.error(f"❌ Worker {worker.pid} abortado")
-
-def pre_fork(server, worker):
-    logger.info(f"🔄 Criando worker")
-
-def post_fork(server, worker):
-    logger.info(f"✅ Worker {worker.pid} iniciado")
-
 # ============================================================================
 # DEVELOPMENT SERVER
 # ============================================================================
 
 if __name__ == '__main__':
-    logger.warning("⚠️  MODO DESENVOLVIMENTO - Use Gunicorn em produção!")
+    logger.warning("⚠️  MODO DESENVOLVIMENTO")
     logger.info("🚀 Servidor: http://0.0.0.0:8000")
-    logger.info("📖 Produção: gunicorn --config gunicorn.conf.py app:app")
-    logger.info(f"💾 RAM/request: ~{CONFIG['MAX_CONTENT_LENGTH'] * 3 / (1024**2):.0f}MB")
-    logger.info(f"🔧 Line cleanup: {'ENABLED' if CONFIG['ENABLE_LINE_CLEANUP'] else 'DISABLED'}")
-    if CONFIG['ENABLE_LINE_CLEANUP']:
-        logger.info(f"   • Sensitivity: threshold={CONFIG['LINE_OVERLAP_THRESHOLD']}")
+    
+    if not CONFIG['API_KEYS']:
+        logger.error("=" * 80)
+        logger.error("❌ NENHUMA API KEY CONFIGURADA!")
+        logger.error("🔑 Gere uma key com:")
+        logger.error(f"   python -c \"import secrets; print(secrets.token_hex(32))\"")
+        logger.error("")
+        test_key = generate_api_key()
+        logger.error(f"   Exemplo: API_KEYS={test_key}")
+        logger.error("=" * 80)
+    else:
+        logger.info(f"✅ {len(CONFIG['API_KEYS'])} API key(s) configurada(s)")
+    
     app.run(host='0.0.0.0', port=8000, debug=False, threaded=True)
