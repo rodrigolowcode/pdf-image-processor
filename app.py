@@ -1,7 +1,7 @@
 """
 PDF/Image Processor - Production Ready v3.3
 Configurável via variáveis de ambiente do Easypanel
-Inclui detecção e limpeza opcional de linhas sobre texto
+Inclui detecção e limpeza de linhas com sensibilidade ajustável
 Cada request usa 2-3x o tamanho do arquivo em RAM
 Ex: 30MB JPEG → ~90-120MB RAM. Configure workers no Gunicorn conforme RAM disponível.
 """
@@ -41,7 +41,19 @@ CONFIG = {
     'NOISE_THRESHOLD': int(os.getenv('NOISE_THRESHOLD', 100)),
     'LOW_CONTRAST_THRESHOLD': int(os.getenv('LOW_CONTRAST_THRESHOLD', 50)),
     'MAGIC_BUFFER_SIZE': int(os.getenv('MAGIC_BUFFER_SIZE', 8192)),
+    
+    # DETECÇÃO DE LINHAS (NOVO)
     'ENABLE_LINE_CLEANUP': os.getenv('ENABLE_LINE_CLEANUP', 'false').lower() == 'true',
+    'LINE_OVERLAP_THRESHOLD': int(os.getenv('LINE_OVERLAP_THRESHOLD', 2)),
+    'LINE_MIN_TEXT_DENSITY': float(os.getenv('LINE_MIN_TEXT_DENSITY', 0.01)),
+    'LINE_MIN_PIXELS_OVERLAP': int(os.getenv('LINE_MIN_PIXELS_OVERLAP', 40)),
+    'LINE_OVERLAP_PERCENTAGE': float(os.getenv('LINE_OVERLAP_PERCENTAGE', 0.08)),
+    'LINE_MIN_LENGTH': int(os.getenv('LINE_MIN_LENGTH', 50)),
+    'LINE_HOUGH_THRESHOLD': int(os.getenv('LINE_HOUGH_THRESHOLD', 60)),
+    'LINE_HOUGH_MIN_LENGTH': int(os.getenv('LINE_HOUGH_MIN_LENGTH', 80)),
+    'LINE_HOUGH_MAX_GAP': int(os.getenv('LINE_HOUGH_MAX_GAP', 10)),
+    'LINE_CANNY_LOW': int(os.getenv('LINE_CANNY_LOW', 40)),
+    'LINE_CANNY_HIGH': int(os.getenv('LINE_CANNY_HIGH', 120)),
 }
 
 ALLOWED_MIMES = {
@@ -60,18 +72,15 @@ def get_redis_url():
     """
     Constrói Redis URL a partir de variáveis individuais ou usa URL completa
     """
-    # Prioridade 1: REDIS_URL completa
     redis_url = os.getenv('REDIS_URL')
     if redis_url:
         return redis_url
     
-    # Prioridade 2: Construir a partir de variáveis separadas
     redis_host = os.getenv('REDIS_HOST', 'localhost')
     redis_port = os.getenv('REDIS_PORT', '6379')
     redis_password = os.getenv('REDIS_PASSWORD', '')
     redis_db = os.getenv('REDIS_DB', '0')
     
-    # Construir URL
     if redis_password:
         return f"redis://:{redis_password}@{redis_host}:{redis_port}/{redis_db}"
     else:
@@ -84,10 +93,8 @@ def get_redis_url():
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = CONFIG['MAX_CONTENT_LENGTH']
 
-# Redis URL configurável via ENV
 redis_url = get_redis_url()
 
-# Rate Limiter com Redis ou Memory
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
@@ -96,7 +103,6 @@ limiter = Limiter(
     strategy="fixed-window"
 )
 
-# Logging configurável via ENV
 log_level = os.getenv('LOG_LEVEL', 'INFO')
 logging.basicConfig(
     level=getattr(logging, log_level.upper()),
@@ -114,7 +120,16 @@ logger.info(f"   • Min dimension: {CONFIG['MIN_DIMENSION']}px")
 logger.info(f"   • Max dimension: {CONFIG['MAX_DIMENSION']}px")
 logger.info(f"   • PDF DPI: {CONFIG['PDF_DPI']}")
 logger.info(f"   • JPEG quality: {CONFIG['JPEG_QUALITY']}")
-logger.info(f"   • Line cleanup: {'ENABLED' if CONFIG['ENABLE_LINE_CLEANUP'] else 'DISABLED'}")
+
+if CONFIG['ENABLE_LINE_CLEANUP']:
+    logger.info(f"🔧 Detecção de linhas: HABILITADA")
+    logger.info(f"   • Overlap threshold: {CONFIG['LINE_OVERLAP_THRESHOLD']}")
+    logger.info(f"   • Text density min: {CONFIG['LINE_MIN_TEXT_DENSITY']:.3f}")
+    logger.info(f"   • Pixels overlap min: {CONFIG['LINE_MIN_PIXELS_OVERLAP']}")
+    logger.info(f"   • Line min length: {CONFIG['LINE_MIN_LENGTH']}px")
+else:
+    logger.info(f"🔧 Detecção de linhas: DESABILITADA")
+
 logger.info(f"🔗 Redis: {redis_url}")
 logger.info(f"🚦 Rate limits: {os.getenv('RATE_LIMIT_PER_MINUTE', 10)}/min, {os.getenv('RATE_LIMIT_PER_HOUR', 100)}/hour")
 logger.info(f"📝 Log level: {log_level}")
@@ -152,7 +167,6 @@ def secure_validation(file: FileStorage) -> Tuple[str, bytes, str]:
     Valida arquivo ANTES de salvar em disco
     Retorna nome seguro, buffer validado e mime type
     """
-    # 1. Validação de tamanho
     file.stream.seek(0, os.SEEK_END)
     size = file.stream.tell()
     
@@ -165,11 +179,9 @@ def secure_validation(file: FileStorage) -> Tuple[str, bytes, str]:
     if size == 0:
         raise ValueError("Arquivo vazio")
     
-    # 2. Lê buffer completo para memória
     file.stream.seek(0)
     buffer = file.stream.read()
     
-    # 3. Valida MIME type do buffer (8KB para segurança)
     try:
         import magic
         mime = magic.from_buffer(
@@ -178,7 +190,6 @@ def secure_validation(file: FileStorage) -> Tuple[str, bytes, str]:
         )
         logger.info(f"🔍 MIME detectado: {mime}")
     except ImportError:
-        # Fallback para extensão se magic não disponível
         logger.warning("⚠️  python-magic não disponível, usando fallback")
         ext = Path(file.filename).suffix.lower()
         mime_map = {
@@ -198,7 +209,6 @@ def secure_validation(file: FileStorage) -> Tuple[str, bytes, str]:
     if not mime or mime not in ALLOWED_MIMES:
         raise ValueError(f"MIME type não permitido: {mime}")
     
-    # 4. Retorna nome seguro, buffer validado e MIME
     return secure_filename(file.filename), buffer, mime
 
 # ============================================================================
@@ -208,8 +218,8 @@ def secure_validation(file: FileStorage) -> Tuple[str, bytes, str]:
 @timeit
 def detect_text_line_overlap_production(image: np.ndarray) -> dict:
     """
-    VERSÃO PRODUÇÃO v3.3
-    Detecta linhas sobre texto de forma otimizada
+    VERSÃO PRODUÇÃO v3.3 - COM SENSIBILIDADE CONFIGURÁVEL
+    Detecta linhas sobre texto usando parâmetros do CONFIG
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape
@@ -236,10 +246,13 @@ def detect_text_line_overlap_production(image: np.ndarray) -> dict:
         11, 2
     )
     
-    # Early return se pouco texto
+    # Early return por densidade de texto (CONFIGURÁVEL)
     text_density = np.sum(text_mask > 0) / text_mask.size
-    if text_density < 0.01:
-        logger.info(f"✅ Densidade de texto < 1% (scale={scale:.2f}), skip")
+    if text_density < CONFIG['LINE_MIN_TEXT_DENSITY']:
+        logger.info(
+            f"✅ Densidade de texto {text_density:.1%} < "
+            f"{CONFIG['LINE_MIN_TEXT_DENSITY']:.1%} (scale={scale:.2f}), skip"
+        )
         return {
             'has_problem': False,
             'overlap_score': 0,
@@ -257,17 +270,17 @@ def detect_text_line_overlap_production(image: np.ndarray) -> dict:
         np.ones((kernel_size, kernel_size), np.uint8)
     )
     
-    # Detecção de linhas
-    canny_low = max(30, int(40 * scale))
-    canny_high = max(100, int(120 * scale))
+    # Detecção de linhas (PARÂMETROS CONFIGURÁVEIS)
+    canny_low = max(30, int(CONFIG['LINE_CANNY_LOW'] * scale))
+    canny_high = max(100, int(CONFIG['LINE_CANNY_HIGH'] * scale))
     edges = cv2.Canny(gray_analysis, canny_low, canny_high)
     
-    hough_threshold = max(50, int(60 * scale))
+    hough_threshold = max(50, int(CONFIG['LINE_HOUGH_THRESHOLD'] * scale))
     lines = cv2.HoughLinesP(
         edges, 1, np.pi/180, 
         hough_threshold,
-        minLineLength=int(80 * scale),
-        maxLineGap=int(10 * scale)
+        minLineLength=int(CONFIG['LINE_HOUGH_MIN_LENGTH'] * scale),
+        maxLineGap=int(CONFIG['LINE_HOUGH_MAX_GAP'] * scale)
     )
     
     if lines is None:
@@ -282,12 +295,12 @@ def detect_text_line_overlap_production(image: np.ndarray) -> dict:
             'text_density': float(text_density)
         }
     
-    # Filtra e ordena
+    # Filtra e ordena (COMPRIMENTO MÍNIMO CONFIGURÁVEL)
     def line_length_squared(line):
         x1, y1, x2, y2 = line[0]
         return (x2 - x1)**2 + (y2 - y1)**2
     
-    min_length_sq = (50 * scale)**2
+    min_length_sq = (CONFIG['LINE_MIN_LENGTH'] * scale)**2
     lines_filtered = [l for l in lines 
                       if line_length_squared(l) >= min_length_sq]
     
@@ -309,7 +322,7 @@ def detect_text_line_overlap_production(image: np.ndarray) -> dict:
         reverse=True
     )
     
-    # Verifica overlap
+    # Verifica overlap (THRESHOLDS CONFIGURÁVEIS)
     overlap_score = 0
     problem_lines = []
     
@@ -323,7 +336,11 @@ def detect_text_line_overlap_production(image: np.ndarray) -> dict:
         overlap = cv2.bitwise_and(text_mask_expanded, line_mask)
         overlap_pixels = np.sum(overlap > 0)
         
-        threshold = max(40, int(line_length * 0.08))
+        # Threshold adaptativo (CONFIGURÁVEL)
+        threshold = max(
+            CONFIG['LINE_MIN_PIXELS_OVERLAP'],
+            int(line_length * CONFIG['LINE_OVERLAP_PERCENTAGE'])
+        )
         
         if overlap_pixels > threshold:
             overlap_score += 1
@@ -349,21 +366,21 @@ def detect_text_line_overlap_production(image: np.ndarray) -> dict:
                 max(0, min(y2, height - 1))
             )
     
-    # Decisão final
-    has_problem = overlap_score > 2
+    # Decisão final (THRESHOLD CONFIGURÁVEL)
+    has_problem = overlap_score > CONFIG['LINE_OVERLAP_THRESHOLD']
     severity = ('none' if overlap_score <= 1 else
                 'moderate' if overlap_score <= 3 else 'severe')
     
     if has_problem:
         logger.info(
-            f"⚠️  Overlap: score={overlap_score}, severity={severity}, "
-            f"scale={scale:.2f}, density={text_density:.1%}, "
+            f"⚠️  Overlap: score={overlap_score} (threshold={CONFIG['LINE_OVERLAP_THRESHOLD']}), "
+            f"severity={severity}, scale={scale:.2f}, density={text_density:.1%}, "
             f"lines={len(problem_lines)}/{len(sorted_lines)}"
         )
     else:
         logger.info(
-            f"✅ Sem overlap (score={overlap_score}, scale={scale:.2f}, "
-            f"density={text_density:.1%})"
+            f"✅ Sem overlap (score={overlap_score}, threshold={CONFIG['LINE_OVERLAP_THRESHOLD']}, "
+            f"scale={scale:.2f}, density={text_density:.1%})"
         )
     
     return {
@@ -384,7 +401,6 @@ def clean_lines_over_text_production(image: np.ndarray, detection_result: dict) 
     Remove linhas detectadas via inpainting
     """
     
-    # Validação
     if not detection_result.get('problem_lines'):
         logger.warning("⚠️  Nenhuma linha para limpar")
         return image
@@ -395,25 +411,21 @@ def clean_lines_over_text_production(image: np.ndarray, detection_result: dict) 
     
     height, width = image.shape[:2]
     
-    # Cria máscara
     lines_mask = np.zeros((height, width), dtype=np.uint8)
     valid_lines = 0
     
     for line_info in detection_result['problem_lines']:
         x1, y1, x2, y2 = line_info['coords']
         
-        # Clipa coordenadas
         x1 = max(0, min(x1, width - 1))
         y1 = max(0, min(y1, height - 1))
         x2 = max(0, min(x2, width - 1))
         y2 = max(0, min(y2, height - 1))
         
-        # Valida
         if x1 == x2 and y1 == y2:
             logger.warning(f"⚠️  Linha colapsou: {line_info['coords']}")
             continue
         
-        # Thickness baseado no comprimento
         length = line_info['length']
         if length > 300:
             thickness = 5
@@ -429,18 +441,15 @@ def clean_lines_over_text_production(image: np.ndarray, detection_result: dict) 
         logger.warning("⚠️  Nenhuma linha válida")
         return image
     
-    # Dilata
     lines_mask = cv2.dilate(
         lines_mask,
         np.ones((2, 2), np.uint8),
         iterations=1
     )
     
-    # Inpainting condicional
     severity = detection_result.get('severity', 'moderate')
     
     if severity == 'moderate':
-        # BGR direto (rápido)
         radius = 3
         result = cv2.inpaint(
             image, lines_mask,
@@ -449,7 +458,6 @@ def clean_lines_over_text_production(image: np.ndarray, detection_result: dict) 
         )
         method = 'BGR'
     else:
-        # LAB (qualidade)
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         
@@ -667,7 +675,13 @@ def health_check():
             'max_file_mb': CONFIG['MAX_CONTENT_LENGTH'] / (1024 * 1024),
             'min_dimension': CONFIG['MIN_DIMENSION'],
             'max_dimension': CONFIG['MAX_DIMENSION'],
-            'line_cleanup_enabled': CONFIG['ENABLE_LINE_CLEANUP']
+            'line_cleanup_enabled': CONFIG['ENABLE_LINE_CLEANUP'],
+            'line_detection_sensitivity': {
+                'overlap_threshold': CONFIG['LINE_OVERLAP_THRESHOLD'],
+                'min_text_density': CONFIG['LINE_MIN_TEXT_DENSITY'],
+                'min_pixels_overlap': CONFIG['LINE_MIN_PIXELS_OVERLAP'],
+                'min_line_length': CONFIG['LINE_MIN_LENGTH']
+            }
         }
     }), 200
 
@@ -720,9 +734,10 @@ def index():
         'status': 'production-ready',
         'worker_pid': os.getpid(),
         'improvements_v3.3': [
-            'Detecção inteligente de linhas sobre texto',
+            'Detecção de linhas com sensibilidade configurável',
             'Limpeza opcional via ENABLE_LINE_CLEANUP',
-            'Performance: 2.5x mais rápido com downscale adaptativo',
+            'Parâmetros ajustáveis via ENV vars',
+            'Performance otimizada com downscale adaptativo',
             'Early return por densidade de texto',
             'Inpainting condicional (BGR ou LAB)'
         ],
@@ -743,14 +758,25 @@ def index():
             'jpeg_quality': CONFIG['JPEG_QUALITY'],
             'line_cleanup': 'ENABLED' if CONFIG['ENABLE_LINE_CLEANUP'] else 'DISABLED'
         },
+        'line_detection_params': {
+            'overlap_threshold': CONFIG['LINE_OVERLAP_THRESHOLD'],
+            'min_text_density': CONFIG['LINE_MIN_TEXT_DENSITY'],
+            'min_pixels_overlap': CONFIG['LINE_MIN_PIXELS_OVERLAP'],
+            'overlap_percentage': CONFIG['LINE_OVERLAP_PERCENTAGE'],
+            'min_line_length': CONFIG['LINE_MIN_LENGTH'],
+            'hough_threshold': CONFIG['LINE_HOUGH_THRESHOLD'],
+            'canny_low': CONFIG['LINE_CANNY_LOW'],
+            'canny_high': CONFIG['LINE_CANNY_HIGH']
+        },
         'environment': {
             'redis_url': redis_url,
             'log_level': log_level,
             'configurable_via': [
                 'MAX_CONTENT_LENGTH', 'MIN_DIMENSION', 'MAX_DIMENSION',
                 'PDF_DPI', 'JPEG_QUALITY', 'ENABLE_LINE_CLEANUP',
-                'REDIS_URL', 'RATE_LIMIT_PER_MINUTE', 'RATE_LIMIT_PER_HOUR',
-                'GUNICORN_WORKERS', 'GUNICORN_TIMEOUT'
+                'LINE_OVERLAP_THRESHOLD', 'LINE_MIN_TEXT_DENSITY',
+                'LINE_MIN_PIXELS_OVERLAP', 'LINE_MIN_LENGTH',
+                'REDIS_URL', 'RATE_LIMIT_PER_MINUTE', 'RATE_LIMIT_PER_HOUR'
             ]
         }
     }), 200
@@ -787,4 +813,6 @@ if __name__ == '__main__':
     logger.info("📖 Produção: gunicorn --config gunicorn.conf.py app:app")
     logger.info(f"💾 RAM/request: ~{CONFIG['MAX_CONTENT_LENGTH'] * 3 / (1024**2):.0f}MB")
     logger.info(f"🔧 Line cleanup: {'ENABLED' if CONFIG['ENABLE_LINE_CLEANUP'] else 'DISABLED'}")
+    if CONFIG['ENABLE_LINE_CLEANUP']:
+        logger.info(f"   • Sensitivity: threshold={CONFIG['LINE_OVERLAP_THRESHOLD']}")
     app.run(host='0.0.0.0', port=8000, debug=False, threaded=True)
