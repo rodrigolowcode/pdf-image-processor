@@ -51,6 +51,44 @@ ALLOWED_MIMES = {
 }
 
 # ============================================================================
+# REDIS CONFIGURATION (adicione após CONFIG)
+# ============================================================================
+
+def get_redis_url():
+    """
+    Constrói Redis URL a partir de variáveis individuais ou usa URL completa
+    """
+    # Prioridade 1: REDIS_URL completa
+    redis_url = os.getenv('REDIS_URL')
+    if redis_url:
+        return redis_url
+    
+    # Prioridade 2: Construir a partir de variáveis separadas
+    redis_host = os.getenv('REDIS_HOST', 'localhost')
+    redis_port = os.getenv('REDIS_PORT', '6379')
+    redis_password = os.getenv('REDIS_PASSWORD', '')
+    redis_db = os.getenv('REDIS_DB', '0')
+    
+    # Construir URL
+    if redis_password:
+        return f"redis://:{redis_password}@{redis_host}:{redis_port}/{redis_db}"
+    else:
+        return f"redis://{redis_host}:{redis_port}/{redis_db}"
+
+# Use a função
+redis_url = get_redis_url()
+
+# Rate Limiter com Redis configurado
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=[f"{os.getenv('RATE_LIMIT_PER_HOUR', 200)} per hour"],
+    storage_uri=redis_url,
+    strategy="fixed-window"
+)
+
+
+# ============================================================================
 # INICIALIZAÇÃO FLASK
 # ============================================================================
 
