@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  # Serviço principal
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      # Gunicorn
+      GUNICORN_WORKERS: 2
+      GUNICORN_TIMEOUT: 120
+      GUNICORN_MAX_REQUESTS: 1000
+      
+      # Redis (usando serviço abaixo)
+      REDIS_URL: redis://redis:6379/0
+      
+      # Rate limiting
+      RATE_LIMIT_PER_MINUTE: 10
+      RATE_LIMIT_PER_HOUR: 100
+      
+      # Application
+      MAX_CONTENT_LENGTH: 31457280  # 30MB
+      MIN_DIMENSION: 1200
+      MAX_DIMENSION: 3500
+      PDF_DPI: 200
+      JPEG_QUALITY: 92
+      
+      # Logging
+      LOG_LEVEL: INFO
+    depends_on:
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - app-network
+
+  # Redis para rate limiting
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+volumes:
+  redis-data:
+    driver: local
+
+networks:
+  app-network:
+    driver: bridge
