@@ -1,0 +1,24 @@
+# Web Framework
+Flask==3.0.3
+Werkzeug==3.0.3
+
+# WSGI Server
+gunicorn==22.0.0
+
+# Rate Limiting
+Flask-Limiter==3.5.1
+redis==5.0.7
+
+# PDF Processing
+pdf2image==1.17.0
+# Poppler binaries são instalados via apt-get no Dockerfile
+
+# Image Processing
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+
+# File Type Detection
+python-magic==0.4.27
+
+# Utilities
+python-dotenv==1.0.1
