@@ -1,10 +1,10 @@
 """
-PDF/Image Processor - Production Ready v3.4
-API Key obrigatória + Rate Limiting avançado por IP
+PDF/Image Processor - Production Ready v3.5
+API Key obrigatória + Rate Limiting + Batch Processing + Streaming
 Configurável via variáveis de ambiente do Easypanel
 """
 
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, jsonify, Response
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from pdf2image import convert_from_path
@@ -23,6 +23,10 @@ from io import BytesIO
 import signal
 import sys
 import secrets
+import zipfile
+import base64
+import json
+from datetime import datetime
 
 # ============================================================================
 # CONFIGURAÇÕES VIA ENVIRONMENT VARIABLES
@@ -54,12 +58,18 @@ CONFIG = {
     'LINE_CANNY_LOW': int(os.getenv('LINE_CANNY_LOW', 40)),
     'LINE_CANNY_HIGH': int(os.getenv('LINE_CANNY_HIGH', 120)),
     
-    # SEGURANÇA (API KEY OBRIGATÓRIA)
+    # SEGURANÇA
     'API_KEYS': [k.strip() for k in os.getenv('API_KEYS', '').split(',') if k.strip()],
     'API_KEY_HEADER': os.getenv('API_KEY_HEADER', 'X-API-Key'),
     'RATE_LIMIT_PER_MINUTE': int(os.getenv('RATE_LIMIT_PER_MINUTE', 10)),
     'RATE_LIMIT_PER_HOUR': int(os.getenv('RATE_LIMIT_PER_HOUR', 100)),
     'RATE_LIMIT_PER_DAY': int(os.getenv('RATE_LIMIT_PER_DAY', 1000)),
+    
+    # BATCH E STREAMING
+    'MAX_FILES_PER_BATCH': int(os.getenv('MAX_FILES_PER_BATCH', 10)),
+    'MAX_BATCH_SIZE': int(os.getenv('MAX_BATCH_SIZE', 100 * 1024 * 1024)),
+    'MAX_FILES_PER_STREAM': int(os.getenv('MAX_FILES_PER_STREAM', 20)),
+    'MAX_STREAM_SIZE': int(os.getenv('MAX_STREAM_SIZE', 200 * 1024 * 1024)),
 }
 
 ALLOWED_MIMES = {
@@ -99,7 +109,6 @@ app.config['MAX_CONTENT_LENGTH'] = CONFIG['MAX_CONTENT_LENGTH']
 
 redis_url = get_redis_url()
 
-# Rate Limiter com limites configuráveis
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
@@ -123,7 +132,7 @@ logger = logging.getLogger(__name__)
 
 # Log de inicialização
 logger.info("=" * 80)
-logger.info("🚀 PDF/Image Processor v3.4 iniciando")
+logger.info("🚀 PDF/Image Processor v3.5 iniciando")
 logger.info(f"📊 Configurações:")
 logger.info(f"   • Max file size: {CONFIG['MAX_CONTENT_LENGTH'] / (1024**2):.0f}MB")
 logger.info(f"   • Min dimension: {CONFIG['MIN_DIMENSION']}px")
@@ -134,7 +143,6 @@ logger.info(f"   • JPEG quality: {CONFIG['JPEG_QUALITY']}")
 if CONFIG['ENABLE_LINE_CLEANUP']:
     logger.info(f"🔧 Detecção de linhas: HABILITADA")
     logger.info(f"   • Overlap threshold: {CONFIG['LINE_OVERLAP_THRESHOLD']}")
-    logger.info(f"   • Text density min: {CONFIG['LINE_MIN_TEXT_DENSITY']:.3f}")
 else:
     logger.info(f"🔧 Detecção de linhas: DESABILITADA")
 
@@ -142,9 +150,11 @@ logger.info(f"🔐 API Key: OBRIGATÓRIA")
 logger.info(f"   • Keys configuradas: {len(CONFIG['API_KEYS'])}")
 logger.info(f"   • Header: {CONFIG['API_KEY_HEADER']}")
 
+logger.info(f"📦 Batch: max {CONFIG['MAX_FILES_PER_BATCH']} arquivos, {CONFIG['MAX_BATCH_SIZE'] / (1024**2):.0f}MB")
+logger.info(f"🌊 Stream: max {CONFIG['MAX_FILES_PER_STREAM']} arquivos, {CONFIG['MAX_STREAM_SIZE'] / (1024**2):.0f}MB")
+
 if not CONFIG['API_KEYS']:
-    logger.error("❌ NENHUMA API KEY CONFIGURADA! Serviço não funcionará.")
-    logger.error("   Configure API_KEYS no Easypanel")
+    logger.error("❌ NENHUMA API KEY CONFIGURADA!")
 
 logger.info(f"🔗 Redis: {redis_url}")
 logger.info(f"🚦 Rate limits: {CONFIG['RATE_LIMIT_PER_MINUTE']}/min, {CONFIG['RATE_LIMIT_PER_HOUR']}/hour, {CONFIG['RATE_LIMIT_PER_DAY']}/day")
@@ -156,7 +166,6 @@ logger.info("=" * 80)
 # ============================================================================
 
 def handle_sigterm(*args):
-    """Graceful shutdown"""
     logger.info("🛑 SIGTERM recebido - shutdown graceful")
     sys.exit(0)
 
@@ -164,38 +173,29 @@ signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
 
 # ============================================================================
-# SEGURANÇA - API KEY (OBRIGATÓRIA)
+# SEGURANÇA - API KEY
 # ============================================================================
 
 def require_api_key(f):
-    """
-    Decorator para proteger endpoints com API Key (OBRIGATÓRIA)
-    Verifica header X-API-Key (ou configurado via API_KEY_HEADER)
-    """
+    """Decorator para proteger endpoints com API Key"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        # API Key sempre obrigatória
         if not CONFIG['API_KEYS']:
-            logger.error("🚫 Nenhuma API Key configurada no servidor")
+            logger.error("🚫 Nenhuma API Key configurada")
             return jsonify({
                 'error': 'Serviço não configurado',
                 'message': 'Servidor sem API Keys configuradas'
             }), 503
         
-        # Obtém API key do header
         api_key = request.headers.get(CONFIG['API_KEY_HEADER'])
         
         if not api_key:
-            logger.warning(
-                f"⚠️  Tentativa sem API Key de {get_remote_address()} "
-                f"para {request.path}"
-            )
+            logger.warning(f"⚠️  Tentativa sem API Key de {get_remote_address()}")
             return jsonify({
                 'error': 'API Key obrigatória',
                 'message': f'Forneça a API Key no header {CONFIG["API_KEY_HEADER"]}'
             }), 401
         
-        # Valida API key (constant-time comparison)
         valid = False
         for valid_key in CONFIG['API_KEYS']:
             if secrets.compare_digest(api_key, valid_key):
@@ -203,16 +203,12 @@ def require_api_key(f):
                 break
         
         if not valid:
-            logger.warning(
-                f"🚫 API Key inválida de {get_remote_address()} "
-                f"para {request.path}: {api_key[:8]}..."
-            )
+            logger.warning(f"🚫 API Key inválida de {get_remote_address()}")
             return jsonify({
                 'error': 'API Key inválida',
                 'message': 'A API Key fornecida não é válida'
             }), 403
         
-        # API Key válida
         logger.debug(f"✅ API Key válida de {get_remote_address()}")
         return f(*args, **kwargs)
     
@@ -234,11 +230,11 @@ def timeit(func):
     return wrapper
 
 def generate_api_key() -> str:
-    """Gera uma API key segura de 32 bytes (64 caracteres hex)"""
+    """Gera API key segura"""
     return secrets.token_hex(32)
 
 def secure_validation(file: FileStorage) -> Tuple[str, bytes, str]:
-    """Valida arquivo ANTES de salvar"""
+    """Valida arquivo"""
     file.stream.seek(0, os.SEEK_END)
     size = file.stream.tell()
     
@@ -257,9 +253,9 @@ def secure_validation(file: FileStorage) -> Tuple[str, bytes, str]:
     try:
         import magic
         mime = magic.from_buffer(buffer[:CONFIG['MAGIC_BUFFER_SIZE']], mime=True)
-        logger.info(f"🔍 MIME detectado: {mime}")
+        logger.info(f"🔍 MIME: {mime}")
     except ImportError:
-        logger.warning("⚠️  python-magic não disponível, usando fallback")
+        logger.warning("⚠️  python-magic não disponível")
         ext = Path(file.filename).suffix.lower()
         mime_map = {
             '.pdf': 'application/pdf',
@@ -279,7 +275,7 @@ def secure_validation(file: FileStorage) -> Tuple[str, bytes, str]:
     return secure_filename(file.filename), buffer, mime
 
 # ============================================================================
-# DETECÇÃO E LIMPEZA DE LINHAS (código mantido do v3.3)
+# DETECÇÃO E LIMPEZA DE LINHAS
 # ============================================================================
 
 @timeit
@@ -306,7 +302,6 @@ def detect_text_line_overlap_production(image: np.ndarray) -> dict:
     
     text_density = np.sum(text_mask > 0) / text_mask.size
     if text_density < CONFIG['LINE_MIN_TEXT_DENSITY']:
-        logger.info(f"✅ Densidade {text_density:.1%} < {CONFIG['LINE_MIN_TEXT_DENSITY']:.1%}, skip")
         return {
             'has_problem': False, 'overlap_score': 0, 'severity': 'none',
             'problem_lines': [], 'scale_used': scale,
@@ -391,9 +386,6 @@ def detect_text_line_overlap_production(image: np.ndarray) -> dict:
     severity = ('none' if overlap_score <= 1 else
                 'moderate' if overlap_score <= 3 else 'severe')
     
-    if has_problem:
-        logger.info(f"⚠️  Overlap: score={overlap_score}, severity={severity}")
-    
     return {
         'has_problem': has_problem, 'overlap_score': overlap_score,
         'severity': severity, 'problem_lines': problem_lines,
@@ -401,10 +393,9 @@ def detect_text_line_overlap_production(image: np.ndarray) -> dict:
         'text_density': float(text_density)
     }
 
-
 @timeit
 def clean_lines_over_text_production(image: np.ndarray, detection_result: dict) -> np.ndarray:
-    """Remove linhas detectadas via inpainting"""
+    """Remove linhas detectadas"""
     if not detection_result.get('problem_lines') or not detection_result.get('has_problem'):
         return image
     
@@ -435,24 +426,22 @@ def clean_lines_over_text_production(image: np.ndarray, detection_result: dict) 
     severity = detection_result.get('severity', 'moderate')
     if severity == 'moderate':
         result = cv2.inpaint(image, lines_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
-        method = 'BGR'
     else:
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         l_clean = cv2.inpaint(l, lines_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
         result = cv2.cvtColor(cv2.merge([l_clean, a, b]), cv2.COLOR_LAB2BGR)
-        method = 'LAB'
     
-    logger.info(f"🧹 Limpeza: {valid_lines} linhas, method={method}")
+    logger.info(f"🧹 Limpeza: {valid_lines} linhas")
     return result
 
 # ============================================================================
-# PROCESSAMENTO DE IMAGENS (código mantido do v3.3)
+# PROCESSAMENTO DE IMAGENS
 # ============================================================================
 
 @timeit
 def optimize_for_cpu(image: np.ndarray) -> np.ndarray:
-    """Pipeline otimizado v3.4"""
+    """Pipeline otimizado"""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
     
@@ -465,7 +454,7 @@ def optimize_for_cpu(image: np.ndarray) -> np.ndarray:
         )
         l = clahe.apply(l)
         image = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-        logger.info(f"✨ CLAHE aplicado (var: {laplacian_var:.2f})")
+        logger.info(f"✨ CLAHE aplicado")
     
     height, width = image.shape[:2]
     min_dim = min(height, width)
@@ -554,6 +543,196 @@ def process_to_memory(buffer: bytes, mime_type: str) -> BytesIO:
     return output_buffer
 
 # ============================================================================
+# PROCESSAMENTO EM LOTE
+# ============================================================================
+
+@timeit
+def process_batch_to_memory(files: list) -> BytesIO:
+    """Processa múltiplos arquivos e retorna ZIP"""
+    zip_buffer = BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        successful = 0
+        failed = 0
+        errors = []
+        
+        for idx, (filename, buffer, mime_type) in enumerate(files, 1):
+            try:
+                logger.info(f"📦 Lote [{idx}/{len(files)}]: {filename}")
+                
+                if mime_type == 'application/pdf':
+                    image = convert_pdf_to_image(buffer)
+                else:
+                    nparr = np.frombuffer(buffer, np.uint8)
+                    image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                if image is None:
+                    raise ValueError("Não foi possível decodificar")
+                
+                processed = optimize_for_cpu(image)
+                
+                success, buffer_encoded = cv2.imencode(
+                    '.jpg', processed,
+                    [cv2.IMWRITE_JPEG_QUALITY, CONFIG['JPEG_QUALITY']]
+                )
+                
+                if not success:
+                    raise ValueError("Falha ao codificar")
+                
+                output_filename = f"processed_{Path(filename).stem}.jpg"
+                zip_file.writestr(output_filename, buffer_encoded.tobytes())
+                
+                successful += 1
+                logger.info(f"✅ [{idx}/{len(files)}] {filename}")
+                
+            except Exception as e:
+                failed += 1
+                error_msg = f"{filename}: {str(e)}"
+                errors.append(error_msg)
+                logger.error(f"❌ [{idx}/{len(files)}] {error_msg}")
+                
+                error_filename = f"ERROR_{Path(filename).stem}.txt"
+                zip_file.writestr(error_filename, str(e))
+        
+        report = (
+            f"Relatório de Processamento em Lote\n"
+            f"=====================================\n"
+            f"Data: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Total: {len(files)}\n"
+            f"Sucesso: {successful}\n"
+            f"Falhas: {failed}\n\n"
+        )
+        
+        if errors:
+            report += "Erros:\n" + "\n".join(f"  • {err}" for err in errors)
+        else:
+            report += "✅ Todos processados com sucesso!"
+        
+        zip_file.writestr('RELATORIO.txt', report)
+        
+        logger.info(f"📦 Lote finalizado: {successful} sucesso, {failed} falhas")
+    
+    zip_buffer.seek(0)
+    return zip_buffer
+
+# ============================================================================
+# PROCESSAMENTO EM STREAMING
+# ============================================================================
+
+def generate_stream_processing(files: list):
+    """Gerador para processar arquivos em streaming (SSE)"""
+    
+    def send_event(event_type: str, data: dict):
+        return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    
+    total_files = len(files)
+    successful = 0
+    failed = 0
+    
+    yield send_event('start', {
+        'message': 'Iniciando processamento',
+        'total_files': total_files,
+        'timestamp': datetime.now().isoformat()
+    })
+    
+    for idx, (filename, buffer, mime_type) in enumerate(files, 1):
+        try:
+            yield send_event('file_start', {
+                'file': filename,
+                'index': idx,
+                'total': total_files,
+                'size_kb': round(len(buffer) / 1024, 2),
+                'mime_type': mime_type
+            })
+            
+            logger.info(f"🌊 Stream [{idx}/{total_files}]: {filename}")
+            
+            if mime_type == 'application/pdf':
+                yield send_event('file_progress', {
+                    'file': filename,
+                    'step': 'converting_pdf',
+                    'message': 'Convertendo PDF...'
+                })
+                image = convert_pdf_to_image(buffer)
+            else:
+                yield send_event('file_progress', {
+                    'file': filename,
+                    'step': 'decoding',
+                    'message': 'Decodificando...'
+                })
+                nparr = np.frombuffer(buffer, np.uint8)
+                image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if image is None:
+                raise ValueError("Não foi possível decodificar")
+            
+            height, width = image.shape[:2]
+            yield send_event('file_progress', {
+                'file': filename,
+                'step': 'dimensions',
+                'message': f'{width}x{height}px'
+            })
+            
+            yield send_event('file_progress', {
+                'file': filename,
+                'step': 'processing',
+                'message': 'Aplicando otimizações...'
+            })
+            
+            processed = optimize_for_cpu(image)
+            
+            yield send_event('file_progress', {
+                'file': filename,
+                'step': 'encoding',
+                'message': 'Codificando...'
+            })
+            
+            success, buffer_encoded = cv2.imencode(
+                '.jpg', processed,
+                [cv2.IMWRITE_JPEG_QUALITY, CONFIG['JPEG_QUALITY']]
+            )
+            
+            if not success:
+                raise ValueError("Falha ao codificar")
+            
+            image_base64 = base64.b64encode(buffer_encoded.tobytes()).decode('utf-8')
+            output_size_kb = round(len(buffer_encoded) / 1024, 2)
+            
+            successful += 1
+            
+            yield send_event('file_complete', {
+                'file': filename,
+                'index': idx,
+                'status': 'success',
+                'output_filename': f"processed_{Path(filename).stem}.jpg",
+                'output_size_kb': output_size_kb,
+                'image_base64': image_base64,
+                'progress': round((idx / total_files) * 100, 1)
+            })
+            
+            logger.info(f"✅ Stream [{idx}/{total_files}] {filename}")
+            
+        except Exception as e:
+            failed += 1
+            logger.error(f"❌ Stream [{idx}/{total_files}] {str(e)}")
+            
+            yield send_event('file_error', {
+                'file': filename,
+                'index': idx,
+                'status': 'error',
+                'error': str(e),
+                'progress': round((idx / total_files) * 100, 1)
+            })
+    
+    yield send_event('complete', {
+        'message': 'Concluído',
+        'total_files': total_files,
+        'successful': successful,
+        'failed': failed,
+        'timestamp': datetime.now().isoformat()
+    })
+
+# ============================================================================
 # ERROR HANDLERS
 # ============================================================================
 
@@ -574,215 +753,76 @@ def ratelimit_handler(e):
 @app.errorhandler(500)
 def internal_error(error):
     logger.error(f"Erro 500: {error}", exc_info=True)
-    return jsonify({'error': 'Erro interno do servidor'}), 500
+    return jsonify({'error': 'Erro interno'}), 500
 
 # ============================================================================
 # ENDPOINTS
 # ============================================================================
 
 @app.route('/health', methods=['GET'])
-@limiter.exempt  # Isento de rate limiting (health checks frequentes)
+@limiter.exempt
 def health_check():
-    """Health check - Informações básicas apenas"""
+    """Health check"""
     return jsonify({
         'status': 'healthy',
-        'version': '3.4'
+        'version': '3.5'
     }), 200
 
 @app.route('/ready', methods=['GET'])
-@limiter.exempt  # Isento de rate limiting
+@limiter.exempt
 def readiness_check():
-    """Readiness check - Kubernetes/Docker"""
+    """Readiness check"""
     return jsonify({
         'status': 'ready',
-        'version': '3.4'
+        'version': '3.5'
     }), 200
 
 @app.route('/', methods=['GET'])
-@limiter.exempt  # Isento de rate limiting
+@limiter.exempt
 def index():
-    """Homepage - Informações básicas apenas"""
+    """Homepage"""
     return jsonify({
         'service': 'PDF/Image Processor',
         'status': 'online',
-        'version': '3.4'
-    }), 200
-
-@app.route('/docs', methods=['GET'])
-@require_api_key  # Protegido - requer API Key
-def documentation():
-    """Documentação completa - REQUER API KEY"""
-    return jsonify({
-        'service': 'PDF/Image Processor',
-        'version': '3.4',
-        'status': 'production-ready',
-        'improvements_v3.4': [
-            '🔐 API Key obrigatória (sempre habilitada)',
-            '🚦 Rate limiting avançado por IP (min/hora/dia)',
-            '📊 Headers X-RateLimit-* informativos',
-            '🔑 Endpoint /generate-key para criar novas keys',
-            '⚡ Detecção de linhas configurável',
-            '🛡️ Constant-time key comparison (timing attack protection)',
-            '✅ Health checks isentos de rate limiting',
-            '🔒 Endpoints públicos minimalistas'
-        ],
-        'security': {
-            'api_key_required': True,
-            'api_key_header': CONFIG['API_KEY_HEADER'],
-            'api_keys_configured': len(CONFIG['API_KEYS']),
-            'rate_limits': {
-                'per_minute': CONFIG['RATE_LIMIT_PER_MINUTE'],
-                'per_hour': CONFIG['RATE_LIMIT_PER_HOUR'],
-                'per_day': CONFIG['RATE_LIMIT_PER_DAY']
-            }
-        },
-        'endpoints': {
-            'POST /process': {
-                'description': 'Processa PDF ou imagem',
-                'authentication': f'API Key no header {CONFIG["API_KEY_HEADER"]}',
-                'rate_limit': f"{CONFIG['RATE_LIMIT_PER_MINUTE']}/min, {CONFIG['RATE_LIMIT_PER_HOUR']}/hour, {CONFIG['RATE_LIMIT_PER_DAY']}/day",
-                'max_size_mb': CONFIG['MAX_CONTENT_LENGTH'] / (1024 * 1024),
-                'formats': list(ALLOWED_MIMES)
-            },
-            'POST /generate-key': {
-                'description': 'Gera nova API key',
-                'authentication': 'API Key (admin)',
-                'protected': True
-            },
-            'GET /health': {
-                'description': 'Health check',
-                'authentication': 'Público',
-                'rate_limit': 'Isento'
-            },
-            'GET /ready': {
-                'description': 'Readiness check',
-                'authentication': 'Público',
-                'rate_limit': 'Isento'
-            },
-            'GET /': {
-                'description': 'Homepage',
-                'authentication': 'Público',
-                'rate_limit': 'Isento'
-            },
-            'GET /docs': {
-                'description': 'Documentação completa',
-                'authentication': 'API Key',
-                'protected': True
-            }
-        },
-        'usage_examples': {
-            'process_file': {
-                'curl': f"curl -X POST \\\n  -H '{CONFIG['API_KEY_HEADER']}: SUA-KEY-AQUI' \\\n  -F 'file=@planta.pdf' \\\n  https://seu-app.easypanel.app/process \\\n  --output resultado.jpg",
-                'python': f"import requests\n\nheaders = {{'{CONFIG['API_KEY_HEADER']}': 'SUA-KEY-AQUI'}}\nfiles = {{'file': open('planta.pdf', 'rb')}}\n\nresponse = requests.post(\n    'https://seu-app.easypanel.app/process',\n    headers=headers,\n    files=files\n)\n\nwith open('resultado.jpg', 'wb') as f:\n    f.write(response.content)",
-                'javascript': f"const formData = new FormData();\nformData.append('file', fileInput.files[0]);\n\nfetch('https://seu-app.easypanel.app/process', {{\n  method: 'POST',\n  headers: {{\n    '{CONFIG['API_KEY_HEADER']}': 'SUA-KEY-AQUI'\n  }},\n  body: formData\n}})\n.then(res => res.blob())\n.then(blob => {{\n  const url = URL.createObjectURL(blob);\n  const a = document.createElement('a');\n  a.href = url;\n  a.download = 'resultado.jpg';\n  a.click();\n}});"
-            },
-            'generate_key': {
-                'curl': f"curl -X POST \\\n  -H '{CONFIG['API_KEY_HEADER']}: SUA-KEY-ADMIN' \\\n  https://seu-app.easypanel.app/generate-key"
-            }
-        },
-        'config': {
-            'processing': {
-                'max_file_mb': CONFIG['MAX_CONTENT_LENGTH'] / (1024 * 1024),
-                'min_dimension': CONFIG['MIN_DIMENSION'],
-                'max_dimension': CONFIG['MAX_DIMENSION'],
-                'pdf_dpi': CONFIG['PDF_DPI'],
-                'jpeg_quality': CONFIG['JPEG_QUALITY']
-            },
-            'line_detection': {
-                'enabled': CONFIG['ENABLE_LINE_CLEANUP'],
-                'overlap_threshold': CONFIG['LINE_OVERLAP_THRESHOLD'],
-                'min_text_density': CONFIG['LINE_MIN_TEXT_DENSITY'],
-                'min_pixels_overlap': CONFIG['LINE_MIN_PIXELS_OVERLAP'],
-                'min_line_length': CONFIG['LINE_MIN_LENGTH']
-            }
-        },
-        'environment_variables': {
-            'required': ['API_KEYS'],
-            'security': [
-                'API_KEY_HEADER',
-                'RATE_LIMIT_PER_MINUTE',
-                'RATE_LIMIT_PER_HOUR',
-                'RATE_LIMIT_PER_DAY'
-            ],
-            'processing': [
-                'MAX_CONTENT_LENGTH',
-                'MIN_DIMENSION',
-                'MAX_DIMENSION',
-                'PDF_DPI',
-                'JPEG_QUALITY'
-            ],
-            'line_detection': [
-                'ENABLE_LINE_CLEANUP',
-                'LINE_OVERLAP_THRESHOLD',
-                'LINE_MIN_TEXT_DENSITY',
-                'LINE_MIN_PIXELS_OVERLAP',
-                'LINE_MIN_LENGTH'
-            ],
-            'redis': [
-                'REDIS_URL',
-                'REDIS_HOST',
-                'REDIS_PORT',
-                'REDIS_PASSWORD',
-                'REDIS_DB'
-            ]
-        }
+        'version': '3.5',
+        'features': ['single', 'batch', 'streaming']
     }), 200
 
 @app.route('/generate-key', methods=['POST'])
-@require_api_key  # Protegido - requer API Key
+@require_api_key
 def generate_key():
-    """Gera nova API key (protegido - só admin pode gerar)"""
+    """Gera nova API key"""
     new_key = generate_api_key()
-    
-    # Formata exemplo de como adicionar a nova key
-    current_keys = ','.join(CONFIG['API_KEYS'][:1])  # Mostra apenas a primeira key por segurança
+    current_keys = ','.join(CONFIG['API_KEYS'][:1])
     
     return jsonify({
         'success': True,
         'api_key': new_key,
-        'message': 'Nova API Key gerada com sucesso',
-        'instructions': {
-            'step_1': 'Copie a API Key acima',
-            'step_2': 'Vá no Easypanel → Seu App → Environment Variables',
-            'step_3': f'Adicione ao final de API_KEYS: {current_keys},...,{new_key}',
-            'step_4': 'Reinicie o serviço'
-        },
+        'message': 'Nova API Key gerada',
         'example': f'API_KEYS={current_keys},{new_key}'
     }), 200
 
 @app.route('/process', methods=['POST'])
-@require_api_key  # Protegido - requer API Key
+@require_api_key
 @limiter.limit(
     f"{CONFIG['RATE_LIMIT_PER_MINUTE']} per minute;"
     f"{CONFIG['RATE_LIMIT_PER_HOUR']} per hour;"
     f"{CONFIG['RATE_LIMIT_PER_DAY']} per day"
 )
 def process_file():
-    """
-    Endpoint principal - Processa PDF ou imagem
-    REQUER API KEY no header X-API-Key (ou configurado)
-    """
+    """Processa arquivo único"""
     if 'file' not in request.files:
-        return jsonify({
-            'error': 'Nenhum arquivo enviado',
-            'message': 'Envie um arquivo usando o campo "file"'
-        }), 400
+        return jsonify({'error': 'Nenhum arquivo enviado'}), 400
     
     file = request.files['file']
     
     if not file.filename:
-        return jsonify({
-            'error': 'Nome de arquivo vazio',
-            'message': 'O arquivo enviado não possui um nome válido'
-        }), 400
+        return jsonify({'error': 'Nome vazio'}), 400
     
     try:
         filename, buffer, mime_type = secure_validation(file)
         
-        logger.info(
-            f"🔄 Processando: {filename} ({len(buffer) / 1024:.1f}KB, {mime_type}) "
-            f"de {get_remote_address()}"
-        )
+        logger.info(f"🔄 Processando: {filename} ({len(buffer) / 1024:.1f}KB)")
         
         output_buffer = process_to_memory(buffer, mime_type)
         
@@ -794,18 +834,121 @@ def process_file():
         )
         
     except ValueError as e:
-        logger.warning(f"⚠️  Validação falhou: {e}")
-        return jsonify({
-            'error': 'Validação falhou',
-            'message': str(e)
-        }), 400
+        logger.warning(f"⚠️  Validação: {e}")
+        return jsonify({'error': str(e)}), 400
         
     except Exception as e:
-        logger.error(f"❌ Erro ao processar: {e}", exc_info=True)
+        logger.error(f"❌ Erro: {e}", exc_info=True)
+        return jsonify({'error': 'Erro ao processar'}), 500
+
+@app.route('/process-batch', methods=['POST'])
+@require_api_key
+@limiter.limit(
+    f"{max(1, CONFIG['RATE_LIMIT_PER_MINUTE'] // 5)} per minute;"
+    f"{max(5, CONFIG['RATE_LIMIT_PER_HOUR'] // 5)} per hour;"
+    f"{max(50, CONFIG['RATE_LIMIT_PER_DAY'] // 5)} per day"
+)
+def process_batch():
+    """Processa múltiplos arquivos (ZIP)"""
+    if 'files[]' not in request.files:
+        return jsonify({'error': 'Nenhum arquivo'}), 400
+    
+    files = request.files.getlist('files[]')
+    
+    if not files or len(files) == 0:
+        return jsonify({'error': 'Lista vazia'}), 400
+    
+    if len(files) > CONFIG['MAX_FILES_PER_BATCH']:
         return jsonify({
-            'error': 'Erro ao processar arquivo',
-            'message': 'Ocorreu um erro interno ao processar o arquivo'
-        }), 500
+            'error': f"Máximo {CONFIG['MAX_FILES_PER_BATCH']} arquivos"
+        }), 400
+    
+    try:
+        validated_files = []
+        total_size = 0
+        
+        for idx, file in enumerate(files, 1):
+            if not file.filename:
+                return jsonify({'error': f'Arquivo #{idx} sem nome'}), 400
+            
+            filename, buffer, mime_type = secure_validation(file)
+            validated_files.append((filename, buffer, mime_type))
+            total_size += len(buffer)
+        
+        if total_size > CONFIG['MAX_BATCH_SIZE']:
+            return jsonify({
+                'error': f"Lote muito grande: {total_size / (1024**2):.1f}MB"
+            }), 400
+        
+        logger.info(f"📦 Lote: {len(files)} arquivos")
+        
+        zip_buffer = process_batch_to_memory(validated_files)
+        
+        return send_file(
+            zip_buffer,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Erro batch: {e}", exc_info=True)
+        return jsonify({'error': 'Erro no lote'}), 500
+
+@app.route('/process-stream', methods=['POST'])
+@require_api_key
+@limiter.limit(
+    f"{max(1, CONFIG['RATE_LIMIT_PER_MINUTE'] // 5)} per minute;"
+    f"{max(5, CONFIG['RATE_LIMIT_PER_HOUR'] // 5)} per hour;"
+    f"{max(50, CONFIG['RATE_LIMIT_PER_DAY'] // 5)} per day"
+)
+def process_stream():
+    """Processa múltiplos arquivos (Streaming SSE)"""
+    if 'files[]' not in request.files:
+        return jsonify({'error': 'Nenhum arquivo'}), 400
+    
+    files = request.files.getlist('files[]')
+    
+    if not files or len(files) == 0:
+        return jsonify({'error': 'Lista vazia'}), 400
+    
+    if len(files) > CONFIG['MAX_FILES_PER_STREAM']:
+        return jsonify({
+            'error': f"Máximo {CONFIG['MAX_FILES_PER_STREAM']} arquivos"
+        }), 400
+    
+    try:
+        validated_files = []
+        total_size = 0
+        
+        for idx, file in enumerate(files, 1):
+            if not file.filename:
+                return jsonify({'error': f'Arquivo #{idx} sem nome'}), 400
+            
+            filename, buffer, mime_type = secure_validation(file)
+            validated_files.append((filename, buffer, mime_type))
+            total_size += len(buffer)
+        
+        if total_size > CONFIG['MAX_STREAM_SIZE']:
+            return jsonify({
+                'error': f"Stream muito grande: {total_size / (1024**2):.1f}MB"
+            }), 400
+        
+        logger.info(f"🌊 Stream: {len(files)} arquivos")
+        
+        return Response(
+            generate_stream_processing(validated_files),
+            mimetype='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no',
+                'Connection': 'keep-alive'
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Erro stream: {e}", exc_info=True)
+        return jsonify({'error': 'Erro no stream'}), 500
 
 # ============================================================================
 # GUNICORN HOOKS
@@ -827,14 +970,9 @@ if __name__ == '__main__':
     
     if not CONFIG['API_KEYS']:
         logger.error("=" * 80)
-        logger.error("❌ NENHUMA API KEY CONFIGURADA!")
-        logger.error("🔑 Gere uma key com:")
-        logger.error(f"   python -c \"import secrets; print(secrets.token_hex(32))\"")
-        logger.error("")
+        logger.error("❌ CONFIGURE API_KEYS!")
         test_key = generate_api_key()
         logger.error(f"   Exemplo: API_KEYS={test_key}")
         logger.error("=" * 80)
-    else:
-        logger.info(f"✅ {len(CONFIG['API_KEYS'])} API key(s) configurada(s)")
     
     app.run(host='0.0.0.0', port=8000, debug=False, threaded=True)
