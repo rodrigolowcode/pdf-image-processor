@@ -441,76 +441,154 @@ def clean_lines_over_text_production(image: np.ndarray, detection_result: dict) 
 
 @timeit
 def optimize_for_cpu(image: np.ndarray) -> np.ndarray:
-    """Pipeline otimizado"""
+    """
+    Pipeline v3.6 - Focado em ALTA DEFINIÇÃO e CONTRASTE
+    """
+    # 1. Converte para LAB para tratar luminosidade
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    
+    # Avalia contraste e nitidez atual
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
     
+    # 2. APLICAÇÃO DE CLAHE (Melhoria de Contraste)
+    # Agora aplica se a variância for menor que o threshold configurado
     if laplacian_var < CONFIG['LOW_CONTRAST_THRESHOLD']:
-        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
         clahe = cv2.createCLAHE(
-            clipLimit=CONFIG['CLAHE_CLIP_LIMIT'],
+            clipLimit=CONFIG['CLAHE_CLIP_LIMIT'], # Aumente isso no ENV para mais contraste
             tileGridSize=(CONFIG['CLAHE_TILE_SIZE'], CONFIG['CLAHE_TILE_SIZE'])
         )
         l = clahe.apply(l)
-        image = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-        logger.info(f"✨ CLAHE aplicado")
+        logger.info(f"✨ CLAHE aplicado (var: {laplacian_var:.2f})")
     
+    # Reconstrói imagem com novo contraste
+    image = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+    # 3. REDIMENSIONAMENTO (Upscale/Downscale)
     height, width = image.shape[:2]
     min_dim = min(height, width)
     max_dim = max(height, width)
     
     if min_dim < CONFIG['MIN_DIMENSION']:
+        # UPSCALE: Usa INTER_CUBIC ou LANCZOS4 para máxima nitidez (mais lento, mas melhor)
         scale = CONFIG['MIN_DIMENSION'] / min_dim
         new_width = int(min(width * scale, CONFIG['MAX_DIMENSION']))
         new_height = int(min(height * scale, CONFIG['MAX_DIMENSION']))
-        image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-        logger.info(f"📐 Upscaled: {new_width}x{new_height}")
+        
+        image = cv2.resize(
+            image, 
+            (new_width, new_height),
+            interpolation=cv2.INTER_CUBIC # ← MUDANÇA: Melhor que LINEAR
+        )
+        logger.info(f"📐 Upscaled (Cubic): {new_width}x{new_height}")
+        
     elif max_dim > CONFIG['MAX_DIMENSION']:
+        # DOWNSCALE: INTER_AREA é o melhor para reduzir sem serrilhado
         scale = CONFIG['MAX_DIMENSION'] / max_dim
         new_width = int(width * scale)
         new_height = int(height * scale)
-        image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+        
+        image = cv2.resize(
+            image, 
+            (new_width, new_height),
+            interpolation=cv2.INTER_AREA
+        )
         logger.info(f"📉 Downscaled: {new_width}x{new_height}")
     
+    # 4. DETECÇÃO E LIMPEZA DE LINHAS (Se habilitado)
     if CONFIG['ENABLE_LINE_CLEANUP']:
         detection = detect_text_line_overlap_production(image)
         if detection['has_problem']:
             image = clean_lines_over_text_production(image, detection)
-    
-    if laplacian_var < CONFIG['NOISE_THRESHOLD']:
+
+    # 5. DENOISING (Remoção de Ruído)
+    # Só aplica se realmente necessário, pois isso remove nitidez
+    if laplacian_var < CONFIG['NOISE_THRESHOLD'] and CONFIG['MEDIAN_KERNEL'] > 1:
+        # Aplica apenas no canal de luminosidade para preservar cores
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         l = cv2.medianBlur(l, CONFIG['MEDIAN_KERNEL'])
         image = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-        logger.info("🧹 MedianBlur aplicado")
+        logger.info(f"🧹 MedianBlur aplicado")
+
+    # 6. SHARPENING (Nitidez Agressiva)
+    # Usa um kernel de convolução específico para destacar texto e bordas
+    kernel_sharpening = np.array([
+        [-1, -1, -1], 
+        [-1,  9, -1], 
+        [-1, -1, -1]
+    ])
     
-    blurred = cv2.GaussianBlur(image, (0, 0), 3.0)
-    image = cv2.addWeighted(image, 1.8, blurred, -0.8, 0)
-    logger.info("🔪 Sharpening aplicado")
+    # Aplica o filtro. Isso destaca muito mais que o unsharp mask anterior.
+    image = cv2.filter2D(image, -1, kernel_sharpening)
+    logger.info("🔪 Sharpening (Kernel) aplicado")
     
     return image
 
 @timeit
 def convert_pdf_to_image(pdf_buffer: bytes) -> np.ndarray:
-    """Converte PDF para imagem"""
+    """
+    Converte PDF para imagem com MÁXIMA QUALIDADE
+    v3.6 - Otimizado para plantas técnicas e documentos detalhados
+    """
     with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
         tmp.write(pdf_buffer)
         tmp_path = tmp.name
     
     try:
+        # ========== CONVERSÃO COM QUALIDADE MÁXIMA ==========
         images = convert_from_path(
-            tmp_path, dpi=CONFIG['PDF_DPI'], first_page=1, last_page=1,
-            fmt='jpeg', thread_count=2, use_pdftocairo=True, grayscale=False
+            tmp_path,
+            dpi=CONFIG['PDF_DPI'],          # ← Vai usar 300 DPI (da ENV var)
+            first_page=1,
+            last_page=1,
+            fmt='png',                       # ← MUDANÇA: PNG em vez de JPEG (sem compressão)
+            thread_count=2,
+            use_pdftocairo=True,            # ← Motor mais preciso (mantém)
+            grayscale=False,
+            transparent=False,
+            
+            # ========== NOVOS PARÂMETROS ==========
+            output_folder=None,
+            paths_only=False,
+            single_file=False,
+            strict=False,
+            userpw=None,
+            ownerpw=None,
+            poppler_path=None,
+            hide_annotations=False,
+            timeout=None,
+            size=None                        # Permite tamanho natural (sem limite)
         )
+        
         if not images:
             raise ValueError("PDF vazio ou corrompido")
-        return cv2.cvtColor(np.array(images[0]), cv2.COLOR_RGB2BGR)
+        
+        # Converte PIL → OpenCV mantendo TODOS os canais de cor
+        pil_image = images[0]
+        
+        # Se o PDF tiver transparência, remove (converte para branco de fundo)
+        if pil_image.mode == 'RGBA':
+            # Cria fundo branco
+            background = Image.new('RGB', pil_image.size, (255, 255, 255))
+            background.paste(pil_image, mask=pil_image.split()[3])  # Alpha channel como mask
+            pil_image = background
+            logger.info("🖼️  PDF com transparência convertido para RGB (fundo branco)")
+        
+        # Converte PIL RGB → OpenCV BGR (padrão do OpenCV)
+        image_array = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        
+        height, width = image_array.shape[:2]
+        logger.info(f"📄 PDF → Imagem: {width}x{height}px @ {CONFIG['PDF_DPI']} DPI")
+        
+        return image_array
+        
     finally:
         try:
             os.unlink(tmp_path)
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Falha ao remover temp PDF: {e}")
 
 @timeit
 def process_to_memory(buffer: bytes, mime_type: str) -> BytesIO:
@@ -849,51 +927,78 @@ def process_file():
     f"{CONFIG['RATE_LIMIT_PER_DAY']} per day"
 )
 def process_batch():
-    """Processa múltiplos arquivos (ZIP)"""
-    if 'files[]' not in request.files:
-        return jsonify({'error': 'Nenhum arquivo'}), 400
-    
-    files = request.files.getlist('files[]')
-    
+    """
+    Processa múltiplos arquivos em lote (ZIP)
+    Aceita campos: 'files[]', 'files' ou 'file'
+    """
+    # Tenta pegar arquivos com qualquer um dos nomes
+    files = None
+
+    if 'files[]' in request.files:
+        files = request.files.getlist('files[]')
+    elif 'files' in request.files:
+        files = request.files.getlist('files')
+    elif 'file' in request.files:
+        files = [request.files['file']]
+
     if not files or len(files) == 0:
-        return jsonify({'error': 'Lista vazia'}), 400
-    
+        return jsonify({
+            'error': 'Nenhum arquivo enviado',
+            'message': 'Envie arquivo(s) usando o campo "files[]", "files" ou "file"'
+        }), 400
+
     if len(files) > CONFIG['MAX_FILES_PER_BATCH']:
         return jsonify({
-            'error': f"Máximo {CONFIG['MAX_FILES_PER_BATCH']} arquivos"
+            'error': 'Muitos arquivos',
+            'message': f'Máximo de {CONFIG["MAX_FILES_PER_BATCH"]} arquivos por lote',
+            'received': len(files)
         }), 400
-    
+
     try:
         validated_files = []
         total_size = 0
-        
+
         for idx, file in enumerate(files, 1):
             if not file.filename:
-                return jsonify({'error': f'Arquivo #{idx} sem nome'}), 400
-            
+                return jsonify({
+                    'error': f'Arquivo #{idx} sem nome',
+                    'message': 'Todos os arquivos devem ter um nome válido'
+                }), 400
+
             filename, buffer, mime_type = secure_validation(file)
             validated_files.append((filename, buffer, mime_type))
             total_size += len(buffer)
-        
+
         if total_size > CONFIG['MAX_BATCH_SIZE']:
             return jsonify({
-                'error': f"Lote muito grande: {total_size / (1024**2):.1f}MB"
+                'error': 'Lote muito grande',
+                'message': (
+                    f'Tamanho total do lote: {total_size / (1024**2):.1f}MB, '
+                    f'máximo: {CONFIG["MAX_BATCH_SIZE"] / (1024**2):.0f}MB'
+                )
             }), 400
-        
-        logger.info(f"📦 Lote: {len(files)} arquivos")
-        
+
+        logger.info(
+            f"📦 Iniciando lote: {len(validated_files)} arquivos, "
+            f"{total_size / 1024:.1f}KB total de {get_remote_address()}"
+        )
+
         zip_buffer = process_batch_to_memory(validated_files)
-        
+
         return send_file(
             zip_buffer,
             mimetype='application/zip',
             as_attachment=True,
-            download_name=f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            download_name=f"processed_batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
         )
-        
+
     except Exception as e:
-        logger.error(f"❌ Erro batch: {e}", exc_info=True)
-        return jsonify({'error': 'Erro no lote'}), 500
+        logger.error(f"❌ Erro no lote: {e}", exc_info=True)
+        return jsonify({
+            'error': 'Erro ao processar lote',
+            'message': 'Ocorreu um erro interno ao processar os arquivos'
+        }), 500
+
 
 @app.route('/process-stream', methods=['POST'])
 @require_api_key
