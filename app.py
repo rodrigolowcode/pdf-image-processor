@@ -844,9 +844,9 @@ def process_file():
 @app.route('/process-batch', methods=['POST'])
 @require_api_key
 @limiter.limit(
-    f"{max(1, CONFIG['RATE_LIMIT_PER_MINUTE'] // 5)} per minute;"
-    f"{max(5, CONFIG['RATE_LIMIT_PER_HOUR'] // 5)} per hour;"
-    f"{max(50, CONFIG['RATE_LIMIT_PER_DAY'] // 5)} per day"
+    f"{CONFIG['RATE_LIMIT_PER_MINUTE']} per minute;"
+    f"{CONFIG['RATE_LIMIT_PER_HOUR']} per hour;"
+    f"{CONFIG['RATE_LIMIT_PER_DAY']} per day"
 )
 def process_batch():
     """Processa múltiplos arquivos (ZIP)"""
@@ -898,44 +898,67 @@ def process_batch():
 @app.route('/process-stream', methods=['POST'])
 @require_api_key
 @limiter.limit(
-    f"{max(1, CONFIG['RATE_LIMIT_PER_MINUTE'] // 5)} per minute;"
-    f"{max(5, CONFIG['RATE_LIMIT_PER_HOUR'] // 5)} per hour;"
-    f"{max(50, CONFIG['RATE_LIMIT_PER_DAY'] // 5)} per day"
+    f"{CONFIG['RATE_LIMIT_PER_MINUTE']} per minute;"
+    f"{CONFIG['RATE_LIMIT_PER_HOUR']} per hour;"
+    f"{CONFIG['RATE_LIMIT_PER_DAY']} per day"
 )
 def process_stream():
-    """Processa múltiplos arquivos (Streaming SSE)"""
-    if 'files[]' not in request.files:
-        return jsonify({'error': 'Nenhum arquivo'}), 400
-    
-    files = request.files.getlist('files[]')
-    
+    """
+    Processa múltiplos arquivos em streaming (Server-Sent Events)
+    Aceita campos: 'files[]', 'files' ou 'file'
+    """
+    # Tenta pegar arquivos com qualquer um dos nomes
+    files = None
+
+    if 'files[]' in request.files:
+        files = request.files.getlist('files[]')
+    elif 'files' in request.files:
+        files = request.files.getlist('files')
+    elif 'file' in request.files:
+        files = [request.files['file']]
+
     if not files or len(files) == 0:
-        return jsonify({'error': 'Lista vazia'}), 400
-    
+        return jsonify({
+            'error': 'Nenhum arquivo enviado',
+            'message': 'Envie arquivo(s) usando o campo "files[]", "files" ou "file"'
+        }), 400
+
     if len(files) > CONFIG['MAX_FILES_PER_STREAM']:
         return jsonify({
-            'error': f"Máximo {CONFIG['MAX_FILES_PER_STREAM']} arquivos"
+            'error': 'Muitos arquivos',
+            'message': f'Máximo de {CONFIG["MAX_FILES_PER_STREAM"]} arquivos por stream',
+            'received': len(files)
         }), 400
-    
+
     try:
         validated_files = []
         total_size = 0
-        
+
         for idx, file in enumerate(files, 1):
             if not file.filename:
-                return jsonify({'error': f'Arquivo #{idx} sem nome'}), 400
-            
+                return jsonify({
+                    'error': f'Arquivo #{idx} sem nome',
+                    'message': 'Todos os arquivos devem ter um nome válido'
+                }), 400
+
             filename, buffer, mime_type = secure_validation(file)
             validated_files.append((filename, buffer, mime_type))
             total_size += len(buffer)
-        
+
         if total_size > CONFIG['MAX_STREAM_SIZE']:
             return jsonify({
-                'error': f"Stream muito grande: {total_size / (1024**2):.1f}MB"
+                'error': 'Stream muito grande',
+                'message': (
+                    f'Tamanho total do stream: {total_size / (1024**2):.1f}MB, '
+                    f'máximo: {CONFIG["MAX_STREAM_SIZE"] / (1024**2):.0f}MB'
+                )
             }), 400
-        
-        logger.info(f"🌊 Stream: {len(files)} arquivos")
-        
+
+        logger.info(
+            f"🌊 Iniciando stream: {len(validated_files)} arquivos, "
+            f"{total_size / 1024:.1f}KB total de {get_remote_address()}"
+        )
+
         return Response(
             generate_stream_processing(validated_files),
             mimetype='text/event-stream',
@@ -945,10 +968,13 @@ def process_stream():
                 'Connection': 'keep-alive'
             }
         )
-        
+
     except Exception as e:
-        logger.error(f"❌ Erro stream: {e}", exc_info=True)
-        return jsonify({'error': 'Erro no stream'}), 500
+        logger.error(f"❌ Erro no stream: {e}", exc_info=True)
+        return jsonify({
+            'error': 'Erro ao iniciar stream',
+            'message': 'Ocorreu um erro interno ao processar o stream'
+        }), 500
 
 # ============================================================================
 # GUNICORN HOOKS
