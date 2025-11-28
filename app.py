@@ -310,7 +310,7 @@ def detect_text_line_overlap_production(image: np.ndarray) -> dict:
     
     kernel_size = max(2, int(2 * scale))
     text_mask_expanded = cv2.dilate(text_mask, np.ones((kernel_size, kernel_size), np.uint8))
-    
+
     canny_low = max(30, int(CONFIG['LINE_CANNY_LOW'] * scale))
     canny_high = max(100, int(CONFIG['LINE_CANNY_HIGH'] * scale))
     edges = cv2.Canny(gray_analysis, canny_low, canny_high)
@@ -442,87 +442,94 @@ def clean_lines_over_text_production(image: np.ndarray, detection_result: dict) 
 @timeit
 def optimize_for_cpu(image: np.ndarray) -> np.ndarray:
     """
-    Pipeline v3.6 - Focado em ALTA DEFINIÇÃO e CONTRASTE
+    Pipeline v3.7 - Balanceado: Textos escuros + Tamanho controlado
     """
-    # 1. Converte para LAB para tratar luminosidade
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    
-    # Avalia contraste e nitidez atual
+    # 1. Análise inicial
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
     
-    # 2. APLICAÇÃO DE CLAHE (Melhoria de Contraste)
-    # Agora aplica se a variância for menor que o threshold configurado
+    # 2. CLAHE - Contraste balanceado
     if laplacian_var < CONFIG['LOW_CONTRAST_THRESHOLD']:
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        
         clahe = cv2.createCLAHE(
-            clipLimit=CONFIG['CLAHE_CLIP_LIMIT'], # Aumente isso no ENV para mais contraste
+            clipLimit=CONFIG['CLAHE_CLIP_LIMIT'],  # Agora 2.2 (mais suave)
             tileGridSize=(CONFIG['CLAHE_TILE_SIZE'], CONFIG['CLAHE_TILE_SIZE'])
         )
         l = clahe.apply(l)
+        image = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
         logger.info(f"✨ CLAHE aplicado (var: {laplacian_var:.2f})")
     
-    # Reconstrói imagem com novo contraste
-    image = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-
-    # 3. REDIMENSIONAMENTO (Upscale/Downscale)
+    # 3. REDIMENSIONAMENTO
     height, width = image.shape[:2]
     min_dim = min(height, width)
     max_dim = max(height, width)
     
     if min_dim < CONFIG['MIN_DIMENSION']:
-        # UPSCALE: Usa INTER_CUBIC ou LANCZOS4 para máxima nitidez (mais lento, mas melhor)
         scale = CONFIG['MIN_DIMENSION'] / min_dim
         new_width = int(min(width * scale, CONFIG['MAX_DIMENSION']))
         new_height = int(min(height * scale, CONFIG['MAX_DIMENSION']))
-        
-        image = cv2.resize(
-            image, 
-            (new_width, new_height),
-            interpolation=cv2.INTER_CUBIC # ← MUDANÇA: Melhor que LINEAR
-        )
-        logger.info(f"📐 Upscaled (Cubic): {new_width}x{new_height}")
+        image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+        logger.info(f"📐 Upscaled: {new_width}x{new_height}")
         
     elif max_dim > CONFIG['MAX_DIMENSION']:
-        # DOWNSCALE: INTER_AREA é o melhor para reduzir sem serrilhado
         scale = CONFIG['MAX_DIMENSION'] / max_dim
         new_width = int(width * scale)
         new_height = int(height * scale)
-        
-        image = cv2.resize(
-            image, 
-            (new_width, new_height),
-            interpolation=cv2.INTER_AREA
-        )
+        image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
         logger.info(f"📉 Downscaled: {new_width}x{new_height}")
     
-    # 4. DETECÇÃO E LIMPEZA DE LINHAS (Se habilitado)
+    # 4. DETECÇÃO E LIMPEZA DE LINHAS
     if CONFIG['ENABLE_LINE_CLEANUP']:
         detection = detect_text_line_overlap_production(image)
         if detection['has_problem']:
             image = clean_lines_over_text_production(image, detection)
-
-    # 5. DENOISING (Remoção de Ruído)
-    # Só aplica se realmente necessário, pois isso remove nitidez
+    
+    # 5. DENOISING (muito conservador)
     if laplacian_var < CONFIG['NOISE_THRESHOLD'] and CONFIG['MEDIAN_KERNEL'] > 1:
-        # Aplica apenas no canal de luminosidade para preservar cores
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         l = cv2.medianBlur(l, CONFIG['MEDIAN_KERNEL'])
         image = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-        logger.info(f"🧹 MedianBlur aplicado")
-
-    # 6. SHARPENING (Nitidez Agressiva)
-    # Usa um kernel de convolução específico para destacar texto e bordas
-    kernel_sharpening = np.array([
-        [-1, -1, -1], 
-        [-1,  9, -1], 
-        [-1, -1, -1]
-    ])
+        logger.info("🧹 MedianBlur aplicado")
     
-    # Aplica o filtro. Isso destaca muito mais que o unsharp mask anterior.
-    image = cv2.filter2D(image, -1, kernel_sharpening)
-    logger.info("🔪 Sharpening (Kernel) aplicado")
+    # 6. INTENSIFICAÇÃO DE TEXTO (NOVO - Garante preto sólido)
+    # Converte para escala de cinza para análise de texto
+    gray_check = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+    # Detecta se há texto/linhas (variância alta indica conteúdo técnico)
+    if laplacian_var > 30:  # Tem texto/desenho
+        # Binarização adaptativa para reforçar preto do texto
+        # Isso garante que texto fique PRETO SÓLIDO
+        binary = cv2.adaptiveThreshold(
+            gray_check, 255, 
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 
+            blockSize=11, 
+            C=2
+        )
+        
+        # Cria uma máscara onde o texto é preto (valor < 128)
+        text_mask = binary < 128
+        
+        # Intensifica o preto nas áreas de texto
+        # Mantém as cores originais, mas escurece onde há texto
+        image_darkened = image.copy()
+        for c in range(3):  # Para cada canal BGR
+            channel = image[:, :, c]
+            # Onde há texto (text_mask), multiplica por 0.7 (escurece 30%)
+            channel[text_mask] = np.clip(channel[text_mask] * 0.7, 0, 255).astype(np.uint8)
+            image_darkened[:, :, c] = channel
+        
+        image = image_darkened
+        logger.info("🖤 Texto intensificado (escurecido)")
+    
+    # 7. SHARPENING MODERADO (mais suave que antes)
+    # Usa Unsharp Mask em vez de kernel agressivo
+    gaussian = cv2.GaussianBlur(image, (0, 0), 2.0)
+    image = cv2.addWeighted(image, 1.5, gaussian, -0.5, 0)
+    logger.info("🔪 Sharpening (Unsharp Mask) aplicado")
     
     return image
 
